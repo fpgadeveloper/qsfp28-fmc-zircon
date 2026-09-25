@@ -1,0 +1,36 @@
+RemoteSystemsTempFiles/
+Vivado/.Xil/
+Vivado/logs/
+Vivado/sim/xsim_work/
+Vivado/sim/xsim.dir/
+Vivado/sim/*.pb
+Vivado/sim/*.wdb
+Vivado/src/hdl/tb/xsim.dir/
+Vivado/src/hdl/tb/*.pb
+Vivado/src/hdl/tb/*.wdb
+*.log
+*.jou
+Vitis/*_workspace/
+Vitis/.*/
+Vitis/.*
+Vitis/boot/
+docs/build/
+bootimages/
+/.*.lock
+/.Xil/
+**/__pycache__/
+# UPDATER START
+Vivado/vck190_fmcp1/
+# UPDATER END
+dfx_runtime.txt
+.repo.yaml
+.memdata_temp_mem_file.mem
+Vivado/*.bif
+Vivado/*.pdi
+Vivado/*.rcdo
+Vivado/*.rnpi
+Vivado/wdi_info.xml
+__pycache__/
+*.pyc
+Vivado/gen_files/
+Vivado/static_files/

@@ -1,0 +1,27 @@
+{
+	"bd_name": "zircon",
+	"app_name": "echo_server",
+	"app_template": "None",
+	"bsp_libs": [
+		{
+			"name": "lwip220",
+			"config": {
+				"lwip220_dhcp": "true",
+				"lwip220_pbuf_pool_size": "2048",
+				"lwip220_n_tx_descriptors": "64",
+				"lwip220_n_rx_descriptors": "64",
+				"lwip220_tcp_wnd": "32768",
+				"lwip220_tcp_snd_buf": "16384"
+			}
+		},
+		{
+			"name": "xiltimer"
+		}
+	],
+	"src": {
+		"all": "common/src"
+	},
+	"stack_size": "0x10000",
+	"heap_size": "0x10000",
+	"combine_bit_elf": false
+}

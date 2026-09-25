@@ -1,0 +1,31 @@
+{
+  "bd_name": "zircon",
+  "prj_name": "qsfp28-fmc-zircon",
+  "groups": [
+    {
+      "label": "versal",
+      "name": "Versal"
+    }
+  ],
+  "designs": [
+    {
+      "publish": true,
+      "label": "vck190_fmcp1",
+      "board": "VCK190",
+      "link": "https://www.xilinx.com/vck190",
+      "url": "xilinx.com",
+      "boardname": "vck190",
+      "bdscript": "versal",
+      "ports": 2,
+      "fec": "rs",
+      "linkspeed": "100",
+      "connector": "FMCP1",
+      "group": "versal",
+      "baremetal": true,
+      "petalinux": false,
+      "yocto": false,
+      "license": true,
+      "ip_license": true
+    }
+  ]
+}
