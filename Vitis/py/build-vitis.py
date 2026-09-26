@@ -34,7 +34,7 @@
 #   "vivado_postfix": "",          # optional: appended to Vivado project dir name
 #   "linker_script_mods": {        # optional: per-arch linker script modifications
 #     "microblaze": "relocate_to_local_mem",   # or "relocate_to_ddr" / "code_local_bss_ddr"
-#     "zynq": "relocate_to_ddr"
+#     "zynq": "relocate_to_ddr"    #   (see "Linker script modifications" below)
 #   },
 #   "compile_optimization": {      # optional: per-arch app optimisation level (the
 #     "microblaze": "-O2"          #   app component's USER_COMPILE_OPTIMIZATION_LEVEL,
@@ -89,6 +89,56 @@
 # NOTE: this is deliberately NOT the existing "pre_platform_build_script" hook.
 # That one runs after create_platform_component() (it is handed the platform
 # object), which is too late to influence the platform's own device tree.
+#
+# Other optional, per-repo behaviour (all inert unless its trigger is present)
+# ---------------------------------------------------------------------------
+# Hooks keyed off args.json:
+#   "pre_platform_build_script"  module exposing pre_platform_build(platform=,
+#                          domain_name=, arch=); run before platform.build().
+#   "pre_build_script"     script run as `python <script> <app_src>` before the
+#                          app is built (non-zero exit aborts the build).
+#   "src_overrides"        {"<target>": <src entry>} replaces the arch-based
+#                          "src" copy for that one target.
+#   stack_size / heap_size / compile_optimization / gc_sections accept a plain
+#                          value (every architecture) or a per-arch map; an
+#                          architecture not in the map keeps the tool default.
+#
+# Linker script modifications ("linker_script_mods", per arch):
+#   relocate_to_local_mem  every section -> the MicroBlaze local memory (LMB)
+#   relocate_to_ddr        every section -> the first DDR region
+#   code_local_bss_ddr     everything in the LMB except .bss/.heap, which go
+#                          to DDR (MicroBlaze booting from the bitstream with
+#                          a .bss too big for the LMB)
+# relocate_to_* are applied BEFORE the stack/heap sizes are set; code_local_
+# bss_ddr AFTER them (so the section rewrite is the last word on lscript.ld).
+# For a MicroBlaze whose mod is code_local_bss_ddr, the LMB use of the built
+# ELF is printed (informational; needs mb-size on PATH, silently skipped if not).
+#
+# Keyed off config/data.json (the target's design entry):
+#   "linkspeed"            when set, board.h also gets
+#                              #define LINE_RATE     <int>   (e.g. 100, 40, 25)
+#                              #define LINE_RATE_25G <1 if linkspeed == 25 else 0>
+#                          Each app uses the one it needs; nothing is written
+#                          for a target without "linkspeed".
+#
+# Keyed off the repo tree:
+#   EmbeddedSw/            patched embeddedsw drivers/libs: a LOCAL embeddedsw
+#                          repo is assembled in <target>_workspace/embeddedsw
+#                          (patched files + the rest of each patched component
+#                          from the Vitis install) and registered with Vitis.
+#   EmbeddedSw.<arch>/     optional per-arch overlay (e.g. EmbeddedSw.microblaze/)
+#                          copied on top of EmbeddedSw/ for that architecture only.
+#
+# Keyed off the XSA:
+#   axi_pcie / axi_pcie3   when the design has an AXI PCIe bridge AND the local
+#                          embeddedsw repo carries a patched axipcie.yaml
+#                          (EmbeddedSw/XilinxProcessorIPLib/drivers/axipcie_v*/
+#                          data/axipcie.yaml), its root-port property entry is
+#                          set to the one that core publishes (see
+#                          PCIE_PORT_TYPE_PROPS). No patched yaml -> nothing done.
+#   MicroBlaze selection   the application MicroBlaze is 'microblaze_0' (or
+#                          'microblaze_<n>'); MIG calibration MicroBlaze-MCS
+#                          cores are never chosen (see _select_app_microblaze).
 
 import os, sys, re, glob, json, shutil, subprocess, zipfile, xml.etree.ElementTree as ET
 
@@ -272,7 +322,7 @@ def sync_cmake_sources(app_src):
     info(f"CMakeLists.txt: added {len(missing)} source(s): {', '.join(missing)}")
 
 # ---------------- board.h generator ----------------
-def create_board_h(board_name, target_dir):
+def create_board_h(board_name, target_dir, linkspeed=None):
     vitis_root = os.environ.get("XILINX_VITIS", "")
     # XILINX_VITIS is e.g. /tools/Xilinx/2025.2/Vitis, so version is parent dir name
     vitis_ver = os.path.basename(os.path.dirname(vitis_root)) if vitis_root else "UNKNOWN"
@@ -285,6 +335,19 @@ def create_board_h(board_name, target_dir):
         fd.write(f"#define BOARD_NAME \"{bn_up}\"\n")
         fd.write(f"#define VITIS_VERSION \"{vitis_ver}\"\n")
         fd.write(f"#define BOARD_{bn_up} 1\n")
+        if linkspeed is not None:
+            # Per-port line rate of this target (data.json "linkspeed", e.g.
+            # 100, 40, 25, 10). Two forms, each app uses the one it needs:
+            #   LINE_RATE      the rate in Gb/s (2x-qsfp28-fmc: MAC bring-up
+            #                  config and the Si5328 GT refclk plan)
+            #   LINE_RATE_25G  1 for 25G, else 0 (sfp28-fmc-mrmac: MRMAC MODE)
+            ls = str(linkspeed).strip()
+            if ls.isdigit():
+                fd.write(f"#define LINE_RATE {int(ls)}\n")
+            else:
+                info(f"WARNING: data.json linkspeed {linkspeed!r} is not an integer; "
+                     f"LINE_RATE not defined")
+            fd.write(f"#define LINE_RATE_25G {1 if str(linkspeed) == '25' else 0}\n")
         fd.write("#endif\n")
     info(f"Generated {path}")
 
@@ -325,6 +388,67 @@ def _select_app_microblaze(names):
         re.fullmatch(r"microblaze_\d+", n.split("/")[-1]) is None,
     ))
     return cands[0]
+
+# ---------------- optional: AXI PCIe root-port property (axipcie.yaml) ----------------
+# The system device tree names the AXI PCIe root-port flag differently
+# depending on which bridge core the design instantiates:
+#
+#   axi_pcie  (Gen2) -> xlnx,port-type     = <0x1>  (added by the SDT generator
+#                                                    from CONFIG.INCLUDE_RC)
+#   axi_pcie3 (Gen3) -> xlnx,dev-port-type = <0x2>  (the core's DEV_PORT_TYPE
+#                                                    parameter, PCIe port type)
+#
+# Both cores are served by the same axipcie driver, whose axipcie.yaml can name
+# only one of the two in its "required" list -- and the field it does not name
+# is simply absent from the node, so the BSP generator writes 0 into the
+# IncludeRootComplex field of the config table. The application then aborts with
+# "Failed to initialize...AXI PCIE is configured as endpoint" even though the
+# core really is a root port. Point the yaml at the property this design's core
+# actually publishes.
+#
+# Inert unless the repo patches axipcie.yaml under EmbeddedSw/ (only then does
+# the local embeddedsw copy contain one) and the XSA has an axi_pcie/axi_pcie3.
+PCIE_PORT_TYPE_PROPS = [
+    ("xilinx.com:ip:axi_pcie:",  "xlnx,port-type"),
+    ("xilinx.com:ip:axi_pcie3:", "xlnx,dev-port-type"),
+]
+
+def pcie_port_type_prop(xsa_path, bd_name):
+    """SDT property carrying the root-port flag for this design's PCIe bridge.
+    Returns None for designs with no AXI PCIe bridge (xdma/qdma designs use the
+    xdmapcie driver, whose yaml is not patched)."""
+    if not zipfile.is_zipfile(xsa_path):
+        return None
+    vlnvs = []
+    with zipfile.ZipFile(xsa_path, "r") as z:
+        for name in z.namelist():
+            if name.lower() == bd_name + ".hwh":
+                try:
+                    vlnvs += [v for _, v in _find_modules(z.read(name))]
+                except KeyError:
+                    pass
+    for vlnv_prefix, prop in PCIE_PORT_TYPE_PROPS:
+        if any(v.startswith(vlnv_prefix) for v in vlnvs):
+            return prop
+    return None
+
+def set_axipcie_port_type(local_esw, prop):
+    """Rewrite the patched axipcie.yaml's port-type entry to `prop`. Silent
+    no-op when the local embeddedsw copy has no axipcie.yaml."""
+    pattern = os.path.join(local_esw, "XilinxProcessorIPLib", "drivers",
+                           "axipcie_v*", "data", "axipcie.yaml")
+    for yaml_path in glob.glob(pattern):
+        with open(yaml_path, "r", encoding="utf-8") as f:
+            text = f.read()
+        new_text, n = re.subn(r"(?m)^([ \t]*-[ \t]*)xlnx,(?:dev-)?port-type[ \t]*$",
+                              r"\g<1>" + prop, text)
+        if not n:
+            info(f"  WARNING: no port-type entry found in {yaml_path}")
+            continue
+        if new_text != text:
+            with open(yaml_path, "w", encoding="utf-8") as f:
+                f.write(new_text)
+        info(f"  axipcie.yaml: root-port property set to {prop}")
 
 def detect_arch_and_cpu_from_xsa(xsa_path, bd_name):
     """
@@ -372,6 +496,15 @@ def resolve_size_option(value, arch):
 # small-data window), constructors, .drvcfg_sec and the stack -- goes to the
 # local memory, which is all updatemem can embed in the bitstream.
 CODE_LOCAL_DDR_SECTIONS = (".bss", ".heap")
+
+# Linker mods applied AFTER the stack/heap sizes are set through the Vitis API
+# (the others are applied before, as they always were).
+LINKER_MODS_AFTER_SIZES = ("code_local_bss_ddr",)
+
+# Linker mods after which the LMB use of the built MicroBlaze ELF is reported
+# (log only). Kept to code_local_bss_ddr so the relocate_to_* repos' build logs
+# stay as they were; adding "relocate_to_local_mem" here is safe.
+LINKER_MODS_REPORT_LMB = ("code_local_bss_ddr",)
 
 def _relocate_sections(text, names, target_mem):
     """Point the output sections in 'names' at target_mem."""
@@ -626,13 +759,20 @@ def pick_target_interactively(data_json_path):
             return bare[idx - 1].get("label")
         print("Out of range. Try again.")
 
-def load_design_entry(data_json_path, target_label):
+def find_design_entry(data_json_path, target_label):
+    """The target's baremetal design entry in data.json, or None."""
     with open(data_json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     for d in data.get("designs", []):
         if d.get("label") == target_label and d.get("baremetal", False):
             return d
-    die(f"Target '{target_label}' not found (or not baremetal) in data.json")
+    return None
+
+def load_design_entry(data_json_path, target_label):
+    d = find_design_entry(data_json_path, target_label)
+    if d is None:
+        die(f"Target '{target_label}' not found (or not baremetal) in data.json")
+    return d
 
 # ---------------- main ----------------
 def main():
@@ -694,6 +834,15 @@ def main():
         board_name_for_header = design.get("boardname", design.get("board", target))
     else:
         board_name_for_header = target
+
+    # Optional data.json "linkspeed" for board.h (LINE_RATE / LINE_RATE_25G).
+    # Looked up without failing: a target that is not a baremetal entry in
+    # data.json has already died above unless boardnames supplied its name.
+    linkspeed_for_header = None
+    if data_json_path:
+        entry = find_design_entry(data_json_path, target)
+        if entry:
+            linkspeed_for_header = entry.get("linkspeed")
 
     # Vivado project path (with optional postfix)
     vivado_postfix = cfg.get("vivado_postfix", "")
@@ -758,6 +907,11 @@ def main():
         repo_root = os.path.normpath(os.path.join(cwd, ".."))
         local_esw = setup_embeddedsw(repo_root, workspace, arch)
         if local_esw:
+            # Align a patched axipcie.yaml with the PCIe core in this design
+            # (see PCIE_PORT_TYPE_PROPS); no-op for every other repo
+            port_type_prop = pcie_port_type_prop(xsa_path, bd_name)
+            if port_type_prop:
+                set_axipcie_port_type(local_esw, port_type_prop)
             client.set_embedded_sw_repo(level='LOCAL', path=local_esw)
             info(f"Registered local embeddedsw repo: {local_esw}")
 
@@ -884,7 +1038,14 @@ def main():
             sync_cmake_sources(app_src)
 
         # Create board.h in app src
-        create_board_h(board_name_for_header, app_src)
+        create_board_h(board_name_for_header, app_src, linkspeed_for_header)
+
+        # Linker script modifications that go BEFORE the stack/heap sizes
+        lscript_path = os.path.join(app_src, "lscript.ld")
+        linker_mod = linker_mods.get(arch)
+        if arch in linker_mods and linker_mod not in LINKER_MODS_AFTER_SIZES:
+            info(f"Applying linker script mod: {linker_mod}")
+            modify_linker_script(lscript_path, linker_mod)
 
         # Stack/heap size overrides (if configured)
         if stack_size or heap_size:
@@ -896,12 +1057,11 @@ def main():
                 ld.set_heap_size(size=heap_size)
                 info(f"Linker script: heap size set to {heap_size}")
 
-        # Linker script modifications (if configured for this arch), after the
-        # stack/heap sizes so that nothing rewrites the regions afterwards
-        lscript_path = os.path.join(app_src, "lscript.ld")
-        if arch in linker_mods:
-            info(f"Applying linker script mod: {linker_mods[arch]}")
-            modify_linker_script(lscript_path, linker_mods[arch])
+        # Linker script modifications that go AFTER the stack/heap sizes, so
+        # that nothing rewrites the regions afterwards
+        if arch in linker_mods and linker_mod in LINKER_MODS_AFTER_SIZES:
+            info(f"Applying linker script mod: {linker_mod}")
+            modify_linker_script(lscript_path, linker_mod)
 
         # App optimisation level (if configured for this arch)
         if compile_opt:
@@ -926,7 +1086,7 @@ def main():
         build_ok = os.path.isfile(elf_path)
         if build_ok:
             info(f"{app_name} build succeeded: {elf_path}")
-            if arch == "microblaze":
+            if arch == "microblaze" and linker_mod in LINKER_MODS_REPORT_LMB:
                 report_local_mem_use(elf_path, lscript_path)
         else:
             info(f"{app_name} build failed. ")
