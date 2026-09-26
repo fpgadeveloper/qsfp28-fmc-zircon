@@ -275,8 +275,20 @@ class Context:
         self.dev_image = self.impl_dir / (
             f"{repo.bd_name}_wrapper.pdi" if self.family == "versal"
             else f"{repo.bd_name}_wrapper.bit")
-        self.cfgmem_mcs = self.viv_prj / f"{repo.bd_name}_wrapper.mcs"
-        self.cfgmem_prm = self.viv_prj / f"{repo.bd_name}_wrapper.prm"
+        # Configuration-memory image (stage 'cfgmem'). A MicroBlaze target with a
+        # bare-metal app boots its app from the flash too, so the source is the
+        # boot bitstream with the ELF embedded in the LMB BRAM (the standalone
+        # stage's boot file) and the .mcs/.prm go next to it into the Vitis boot
+        # dir (so the standalone zip ships them). Otherwise (processor-less
+        # target) the source is the implemented bitstream itself.
+        if self.family == "microblaze" and self.design.get("baremetal", False):
+            self.cfgmem_src = self.boot_file
+            self.cfgmem_mcs = self.boot_file.with_suffix(".mcs")
+            self.cfgmem_prm = self.boot_file.with_suffix(".prm")
+        else:
+            self.cfgmem_src = self.dev_image
+            self.cfgmem_mcs = self.viv_prj / f"{repo.bd_name}_wrapper.mcs"
+            self.cfgmem_prm = self.viv_prj / f"{repo.bd_name}_wrapper.prm"
         self.bit_zip = self.bootimages / f"{repo.prj_name}_{target}_bitstream-{self.ver_tag}.zip"
 
 
@@ -625,7 +637,10 @@ def stage_cfgmem(ctx: Context):
     """Write the target's configuration-memory image (.mcs) from its bitstream.
 
     Only a board that loads its own bitstream from a configuration flash needs
-    one; a processor target's bitstream travels inside BOOT.BIN. The stage is
+    one; a hard-processor target's bitstream travels inside BOOT.BIN. On a
+    MicroBlaze bare-metal target the image is made from the boot bitstream
+    (application embedded in the LMB BRAM) and lands in the Vitis boot dir;
+    see Context.cfgmem_src. The stage is
     therefore opt-in and doubly inert: the target must set "cfgmem": true in
     data.json AND the repo must ship Vivado/scripts/cfgmem.tcl (which owns the
     flash part/size/interface table, since those are board facts). No repo that
@@ -637,11 +652,15 @@ def stage_cfgmem(ctx: Context):
         return ("skipped (data.json marks this target cfgmem but the repo "
                 "ships no Vivado/scripts/cfgmem.tcl -- upstream inconsistency)")
     stage_xsa(ctx)
-    if not ctx.dev_image.is_file():
-        fail(f"bitstream missing: {rel_to_repo(ctx.dev_image, ctx.repo.root)} "
-             f"(the XSA stage must write it before an .mcs can be made)")
+    if ctx.cfgmem_src != ctx.dev_image:
+        # MicroBlaze + bare metal: the flash holds the bitstream with the app
+        # embedded, made by the standalone stage (a no-op when up to date).
+        stage_bootfile(ctx)
+    if not ctx.cfgmem_src.is_file():
+        fail(f"bitstream missing: {rel_to_repo(ctx.cfgmem_src, ctx.repo.root)} "
+             f"(it must exist before an .mcs can be made)")
     if (ctx.cfgmem_mcs.is_file()
-            and ctx.cfgmem_mcs.stat().st_mtime >= ctx.dev_image.stat().st_mtime):
+            and ctx.cfgmem_mcs.stat().st_mtime >= ctx.cfgmem_src.stat().st_mtime):
         return "skipped (mcs up to date)"
     ctx.viv_logs.mkdir(exist_ok=True)
     log = ctx.viv_logs / f"{ctx.target}_cfgmem.log"
@@ -649,7 +668,10 @@ def stage_cfgmem(ctx: Context):
                    "-source", "scripts/cfgmem.tcl",
                    "-log", log.as_posix(), "-journal",
                    (ctx.viv_logs / f"{ctx.target}_cfgmem.jou").as_posix(),
-                   "-tclargs", ctx.target],
+                   "-tclargs", ctx.target, ctx.cfgmem_src.as_posix(),
+                   ctx.cfgmem_mcs.as_posix(),
+                   str(ctx.design.get("flashsize", "32")),
+                   str(ctx.design.get("flashintf", "SPIx4"))],
                   cwd=ctx.viv_dir)
     if rc != 0 or not ctx.cfgmem_mcs.is_file():
         fail(f"configuration memory file generation failed (rc={rc}); expected "
@@ -1134,7 +1156,8 @@ def clean_paths(ctx: Context, scope):
     Explicit --stage limits removal to one stage:
       ip                     -> the target's generated HLS IP
       project | xsa          -> the Vivado project (which is also where the
-                                cfgmem stage writes its .mcs/.prm)
+                                cfgmem stage writes its .mcs/.prm, except on a
+                                MicroBlaze bare-metal target: Vitis boot dir)
       standalone             -> the Vitis workspace + boot dir
       petalinux              -> the PetaLinux per-target project
       yocto                  -> the Yocto per-target workspace (huge; hours to rebuild)

@@ -32,9 +32,16 @@
  * GT reset, MRMAC 100G/RS-FEC -> lwIP (one netif per port) + DHCP -> services
  * -> poll loop. See app_config.h for the settings.
  *
+ * KCU116 (MicroBlaze, HW_MAC_CMAC): the same application on port 0 only,
+ * with the UltraScale+ CMAC (Taxi taxi_eth_mac_100g_us behind the
+ * zircon_cmac_us shim, RS(528,514) fixed) instead of the MRMAC. Caches are
+ * enabled first; VADJ is fixed at 1.8 V by the board (nothing to program);
+ * the Si5328 is programmed before the shim releases the GT reset.
+ *
  * Everything runs from one polled main loop, including lwIP's timers, which
- * are paced from the Arm generic timer (XTime_GetTime): no interrupts are
- * used. Console output is buffered (console.c) so printing never stalls it.
+ * are paced from a free-running 64-bit time base (timebase.h: the Arm
+ * generic timer, or axi_timer_1 on MicroBlaze): no interrupts are used.
+ * Console output is buffered (console.c) so printing never stalls it.
  *
  * Console: h help, s status, z registers, f cycle FEC, c clear counters,
  * l / e start/stop the loopback tests, p <bytes> payload size,
@@ -69,6 +76,7 @@
 #include "latency.h"
 #include "latency_wire.h"
 #include "tcp_echo.h"
+#include "timebase.h"
 
 /* lwIP timer periods (NO_SYS_NO_TIMERS: the application calls them) */
 #define TCP_FAST_MS    TCP_FAST_INTERVAL        /* 250 ms */
@@ -82,11 +90,22 @@
 /* ------------------------------------------------------------------------ */
 static void print_help(void)
 {
+#if MAC_SUPPORTS_FEC_CHANGE
 	con_printf("Keys: h help, s status, z zircon registers, f cycle FEC mode, c clear counters\r\n");
+#else
+	con_printf("Keys: h help, s status, z zircon registers, c clear counters (FEC fixed: RS(528,514))\r\n");
+#endif
+#if NUM_PORTS > 1
 	con_printf("      l start/stop the loopback test (port 0 <-> port 1 cable: each port's hardware\r\n"
 		   "        generator -> the other port's hardware checker, 2 x 100G full duplex)\r\n");
 	con_printf("      e start/stop the echo-through-loopback test (port 0 generator -> port 1\r\n"
 		   "        hardware UDP echo -> port 0 checker)\r\n");
+#else
+	con_printf("      l start/stop the loopback test (QSFP28 loopback plug in port 0: hardware\r\n"
+		   "        generator -> plug -> hardware checker, 100G; same as L 0)\r\n");
+	con_printf("      e start/stop the echo-through-loopback test (loopback plug: port 0 generator\r\n"
+		   "        -> plug -> port 0 hardware UDP echo -> plug -> port 0 checker)\r\n");
+#endif
 	con_printf("      L <port> start/stop the self-loopback test on one port (QSFP28 loopback\r\n"
 		   "        plug: the port's generator -> plug -> the same port's checker)\r\n");
 	con_printf("      p <bytes> UDP payload of the tests, 8..9000 (now %lu). 100G line rate needs\r\n"
@@ -95,8 +114,13 @@ static void print_help(void)
 		   (unsigned long)lb_get_len());
 	con_printf("      i <port> dhcp|static|auto  address mode of a port, applied at once (auto =\r\n"
 		   "        dhcp-then-static); i alone shows the address mode and address of every port\r\n");
+#if defined(HW_MAC_CMAC)
+	con_printf("      T [<port>] [c] Enter  latency statistics (zircon_nic 1.3.0): hardware UDP echo\r\n"
+		   "        and software TCP echo, MAC-client SOF RX -> TX; T c clears them\r\n");
+#else
 	con_printf("      T [<port>] [c] Enter  latency statistics (zircon_nic 1.3.0): hardware UDP echo\r\n"
 		   "        and software TCP echo, RX PCS -> TX PCS; T c clears them\r\n");
+#endif
 }
 
 static void print_status_all(u32 now)
@@ -329,18 +353,22 @@ static void console_poll(u32 now)
 		line_len = 0;
 		break;
 	case 'f':
-		switch (fec_mode) {
-		case MRMAC_FEC_RS528:
-			fec_mode = MRMAC_FEC_OFF;
-			break;
-		case MRMAC_FEC_OFF:
-			fec_mode = MRMAC_FEC_RS544;
-			break;
-		default:
-			fec_mode = MRMAC_FEC_RS528;
+		if (!mac_supports_fec_change()) {
+			con_printf("FEC fixed on this target: RS(528,514) (Taxi " MAC_NAME " wrapper)\r\n");
 			break;
 		}
-		con_printf("MRMAC FEC mode -> %s, resetting the MACs\r\n", mrmac_fec_name(fec_mode));
+		switch (fec_mode) {
+		case MAC_FEC_RS528:
+			fec_mode = MAC_FEC_OFF;
+			break;
+		case MAC_FEC_OFF:
+			fec_mode = MAC_FEC_RS544;
+			break;
+		default:
+			fec_mode = MAC_FEC_RS528;
+			break;
+		}
+		con_printf("MRMAC FEC mode -> %s, resetting the MACs\r\n", mac_fec_name(fec_mode));
 		for (p = 0; p < NUM_PORTS; p++) {
 			if (!ports[p].ok)
 				continue;
@@ -366,30 +394,55 @@ int main(void)
 	int ok = 1, any_ok = 0, all_up;
 	int p;
 
+#ifdef __MICROBLAZE__
+	/* The MicroBlaze start-up code leaves the caches off: enable them
+	 * before anything else (the lwIP pools, DMA buffers and heap are in
+	 * DDR). The D-cache is kept coherent with the AXI DMAs by zdma.c's
+	 * flush/invalidate calls and the AXI DMA driver's BD maintenance. */
+	Xil_ICacheEnable();
+	Xil_DCacheEnable();
+#endif
+	timebase_init();
+
 	con_printf("\r\n\r\n----- 2x QSFP28 FMC Zircon echo server (%s) -----\r\n", BOARD_NAME);
+#if defined(HW_MAC_CMAC)
+	con_printf("QSFP ports: %d x 100GbE, UltraScale+ CMAC via Taxi taxi_eth_mac_100g_us (CAUI-4, FEC %s)"
+		   " + zircon_nic (Taxi Zircon)\r\n", NUM_PORTS, mac_fec_name(MAC_FEC_RS528));
+#else
 	con_printf("QSFP ports: %d x 100GbE, Versal MRMAC (CAUI-4, FEC %s) + zircon_nic (Taxi Zircon)\r\n",
-		   NUM_PORTS, mrmac_fec_name(fec_mode));
+		   NUM_PORTS, mac_fec_name(fec_mode));
+#endif
 	for (p = 0; p < NUM_PORTS; p++)
 		port_print_ip_mode(p, port_default_ip_mode(p));
 
+#if !defined(__MICROBLAZE__)
 	/* FMC I/Os are LVCMOS15: VADJ = 1.5 V (VCK190 regulator via LPD I2C0) */
 	if (vadj_enable(VADJ_1V5) != 0)
 		con_printf("WARNING: failed to enable VADJ\r\n");
 	else
 		con_printf("VADJ enabled (1.5V)\r\n");
 	sleep(1);
+#else
+	/* KCU116: VADJ is fixed at 1.8 V by the board, FMC I/Os are LVCMOS18 */
+#endif
 
 	/* GT reference clocks: the FMC's Si5328, free-run 322.265625 MHz on
 	 * CKOUT1 (GBTCLK0, port 0) and CKOUT2 (GBTCLK1, port 1): one
-	 * programming for both ports (si5328.c enables CKOUT2) */
+	 * programming for both ports (si5328.c enables CKOUT2). It must run
+	 * before port_hw_init(): the CMAC shim only releases the GT reset there,
+	 * once the refclk exists. */
 	if (si5328_init(IIC_CLK_BASEADDR, SI5328_OUT_322M266) != 0) {
 		con_printf("ERROR: Si5328 programming failed - no GT refclk\r\n");
 		ok = 0;
 	} else {
+#if defined(HW_MAC_CMAC)
+		con_printf("Si5328 programmed: GT refclk 322.265625 MHz (CKOUT1 port 0)\r\n");
+#else
 		con_printf("Si5328 programmed: GT refclk 322.265625 MHz (CKOUT1 port 0, CKOUT2 port 1)\r\n");
+#endif
 	}
 
-	/* Per port: zircon_nic registers, GT reset, MRMAC 100G/FEC */
+	/* Per port: zircon_nic registers, GT reset, MAC 100G/FEC */
 	for (p = 0; p < NUM_PORTS; p++) {
 		if (port_hw_init(&ports[p], p) != 0)
 			ok = 0;
@@ -433,7 +486,7 @@ int main(void)
 	while ((u32)(now_ms() - t0) < 5000) {
 		all_up = 1;
 		for (p = 0; p < NUM_PORTS; p++) {
-			if (ports[p].ok && !mrmac_port_link_up(ports[p].hw.mrmac))
+			if (ports[p].ok && !mac_link_up(&ports[p].hw))
 				all_up = 0;
 		}
 		if (all_up)

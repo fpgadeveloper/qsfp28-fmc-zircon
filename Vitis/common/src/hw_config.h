@@ -22,6 +22,13 @@
  * what the hardware has (2 when the XSA contains axi_dma_raw_1, else 1) and
  * can be lowered with -DNUM_PORTS=1.
  *
+ * Two hardware families share this file:
+ *   - Versal (bd_versal.tcl, vck190): MRMAC hard MAC per port (mrmac.c)
+ *   - MicroBlaze (bd_microblaze.tcl, kcu116): one port, UltraScale+ CMAC
+ *     through Taxi's taxi_eth_mac_100g_us behind the zircon_cmac_us shim
+ *     (cmac_taxi.c). HW_MAC_CMAC is defined for it; mac.h picks the backend.
+ *     Address map: docs/DESIGN_SPEC.md section 6b.
+ *
  * ==> If the block design changes a cell name, add the new XPAR_ name to the
  *     matching #if chain below. If it moves a zircon_nic, update its
  *     ZIRCON_NIC_<p>_FALLBACK_BASEADDR (unzip Vivado/<target>/zircon_wrapper.xsa
@@ -33,6 +40,72 @@
 #include "xparameters.h"
 #include "xil_types.h"
 
+/* MAC family: the MicroBlaze targets (kcu116) use the CMAC shim */
+#if defined(__MICROBLAZE__) && !defined(HW_MAC_CMAC)
+#define HW_MAC_CMAC 1
+#endif
+
+#if defined(HW_MAC_CMAC)
+/* ======================================================================== */
+/* MicroBlaze / CMAC (bd_microblaze.tcl, KCU116): port 0 only               */
+/* ======================================================================== */
+#define HW_NUM_PORTS 1
+
+/* zircon_nic_0 and the zircon_cmac_0 shim are module references: no XPAR */
+#define ZIRCON_NIC_0_FALLBACK_BASEADDR 0x440A0000UL   /* bd_microblaze.tcl: zircon_nic_0  */
+#define CMAC_0_FALLBACK_BASEADDR       0x44000000UL   /* bd_microblaze.tcl: zircon_cmac_0 */
+#if defined(XPAR_ZIRCON_NIC_0_BASEADDR)
+#define ZIRCON_NIC_0_BASEADDR XPAR_ZIRCON_NIC_0_BASEADDR
+#else
+#define ZIRCON_NIC_0_BASEADDR ZIRCON_NIC_0_FALLBACK_BASEADDR
+#endif
+#if defined(XPAR_ZIRCON_CMAC_0_BASEADDR)
+#define CMAC_0_BASEADDR XPAR_ZIRCON_CMAC_0_BASEADDR
+#else
+#define CMAC_0_BASEADDR CMAC_0_FALLBACK_BASEADDR
+#endif
+
+#if defined(XPAR_AXI_DMA_RAW_BASEADDR)
+#define DMA_RAW_0_BASEADDR XPAR_AXI_DMA_RAW_BASEADDR
+#else
+#error "hw_config.h: no XPAR_ macro for axi_dma_raw -- add its name here"
+#endif
+#if defined(XPAR_AXI_DMA_SOCK_BASEADDR)
+#define DMA_SOCK_0_BASEADDR XPAR_AXI_DMA_SOCK_BASEADDR
+#else
+#error "hw_config.h: no XPAR_ macro for axi_dma_sock -- add its name here"
+#endif
+
+/* QSFP0 sideband GPIO (CH1 out: b0 ModSelL, b1 ResetL, b2 LPMode, reset
+ * value 0x2; CH2 in: b0 ModPrsL, b1 IntL) and management IIC */
+#if defined(XPAR_AXI_GPIO_QSFP0_BASEADDR)
+#define GPIO_QSFP_0_BASEADDR XPAR_AXI_GPIO_QSFP0_BASEADDR
+#else
+#define GPIO_QSFP_0_BASEADDR 0
+#endif
+#if defined(XPAR_AXI_IIC_QSFP0_BASEADDR)
+#define IIC_QSFP_0_BASEADDR XPAR_AXI_IIC_QSFP0_BASEADDR
+#else
+#define IIC_QSFP_0_BASEADDR 0
+#endif
+
+/* Application time base: axi_timer_1, both counters cascaded into one
+ * free-running 64-bit up-counter (timebase.c). axi_timer_0 belongs to
+ * xiltimer (usleep/sleep, py/pre_platform_build.py). */
+#if defined(XPAR_AXI_TIMER_1_BASEADDR)
+#define TIMEBASE_BASEADDR XPAR_AXI_TIMER_1_BASEADDR
+#else
+#error "hw_config.h: no XPAR_ macro for axi_timer_1 (application time base) -- add its name here"
+#endif
+#if defined(XPAR_AXI_TIMER_1_CLOCK_FREQUENCY)
+#define TIMEBASE_HZ XPAR_AXI_TIMER_1_CLOCK_FREQUENCY
+#elif defined(XPAR_AXI_TIMER_1_CLOCK_FREQ_HZ)
+#define TIMEBASE_HZ XPAR_AXI_TIMER_1_CLOCK_FREQ_HZ
+#else
+#define TIMEBASE_HZ 100000000UL     /* bd_microblaze.tcl: sys_clk 100 MHz */
+#endif
+
+#else /* !HW_MAC_CMAC: Versal MRMAC */
 /* ======================================================================== */
 /* Port 0                                                                    */
 /* ======================================================================== */
@@ -164,6 +237,8 @@
 #define HW_NUM_PORTS 1
 #endif
 
+#endif /* HW_MAC_CMAC */
+
 /* ======================================================================== */
 /* Shared: AXI IIC of the FMC's Si5328 (direct bus, address 0x68)            */
 /* ======================================================================== */
@@ -186,8 +261,10 @@
 #endif
 
 typedef struct {
-	UINTPTR mrmac;       /* MRMAC s_axi (port-0 page)              */
+	UINTPTR mac;         /* MRMAC s_axi (port-0 page) / CMAC shim   */
+#if !defined(HW_MAC_CMAC)
 	UINTPTR gpio_gt;     /* GT-control AXI GPIO                    */
+#endif
 	UINTPTR gpio_qsfp;   /* QSFP sideband AXI GPIO (0: none)        */
 	UINTPTR iic_qsfp;    /* QSFP management AXI IIC (0: none)       */
 	UINTPTR zircon;      /* zircon_nic AXI-Lite                     */
@@ -197,9 +274,15 @@ typedef struct {
 	const char *dma_sock_name;
 } hw_port_t;
 
+#if defined(HW_MAC_CMAC)
+#define HW_PORT_0 { CMAC_0_BASEADDR, GPIO_QSFP_0_BASEADDR, IIC_QSFP_0_BASEADDR,  \
+		    ZIRCON_NIC_0_BASEADDR, DMA_RAW_0_BASEADDR, DMA_SOCK_0_BASEADDR, \
+		    "axi_dma_raw", "axi_dma_sock" }
+#else
 #define HW_PORT_0 { MRMAC_0_BASEADDR, GPIO_GT_0_BASEADDR, GPIO_QSFP_0_BASEADDR, \
 		    IIC_QSFP_0_BASEADDR, ZIRCON_NIC_0_BASEADDR, DMA_RAW_0_BASEADDR,  \
 		    DMA_SOCK_0_BASEADDR, "axi_dma_raw", "axi_dma_sock" }
+#endif
 #if HW_NUM_PORTS >= 2
 #define HW_PORT_1 { MRMAC_1_BASEADDR, GPIO_GT_1_BASEADDR, GPIO_QSFP_1_BASEADDR, \
 		    IIC_QSFP_1_BASEADDR, ZIRCON_NIC_1_BASEADDR, DMA_RAW_1_BASEADDR,  \

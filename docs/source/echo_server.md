@@ -1,7 +1,8 @@
 # Stand-alone echo server
 
 The bare-metal application `echo_server` is the only software in the design; there is no Linux
-image. It runs on the Versal PS and is the **control plane**: it brings both 100G ports up,
+image. It runs on the Versal PS (VCK190) or on a MicroBlaze (KCU116, port 0 only; see
+[KCU116 differences](#kcu116-differences)) and is the **control plane**: it brings both 100G ports up,
 configures the Zircon hardware and then mostly watches it. **There is no processor in the
 datapath** of the UDP echo or of the loopback test.
 
@@ -34,9 +35,12 @@ The application is in `Vitis/common/src/`. Every setting a user is likely to cha
 | `console.c` / `.h` | Buffered UART output, drained without blocking from the main loop |
 | `app_config.h` | Address modes and static addresses, ports, FEC mode, loopback test settings, console verbosity |
 | `hw_config.h` | Base addresses of both ports, from the XSA's `xparameters.h`; `NUM_PORTS` |
-| `vadj.c` / `.h` | Sets the VCK190's FMC VADJ rail to 1.5 V over the PS I2C |
+| `vadj.c` / `.h` | Sets the VCK190's FMC VADJ rail to 1.5 V over the PS I2C (not used on the KCU116, whose VADJ is fixed at 1.8 V) |
 | `si5328.c` / `.h` | Programs the FMC's Si5328 to 322.265625 MHz on both outputs (the GT reference clocks of port 0 and port 1) |
-| `mrmac.c` / `.h` | GT reset, MRMAC port configuration including RS-FEC, link status, statistics |
+| `mac.h` | The MAC interface the rest of the application uses; picks `mrmac.c` (VCK190) or `cmac_taxi.c` (KCU116) at compile time |
+| `mrmac.c` / `.h` | GT reset, MRMAC port configuration including RS-FEC, link status, statistics (VCK190) |
+| `cmac_taxi.c` | The KCU116 CMAC shim: transceiver reset release, link status, statistics, the shim's timestamp timer |
+| `timebase.c` / `.h` | The free-running 64-bit time base of the main loop: the Arm generic timer, or `axi_timer_1` on the MicroBlaze |
 | `zircon.c` / `.h` | Driver for the [zircon_nic registers](registers.md) and the socket descriptor |
 | `zdma.c` / `.h` | Polled scatter-gather AXI DMA driver with 64-byte aligned buffers |
 | `zircon_netif.c` / `.h` | The lwIP network interface on UI0 (`axi_dma_raw`, `axi_dma_raw_1`), one instance per port |
@@ -98,6 +102,36 @@ The number of ports, `NUM_PORTS`, follows the XSA (2 when it contains `axi_dma_r
 The detailed register sequences (VADJ, Si5328, GT reset, MRMAC) are in the
 [Bring-up notes](notes_bringup.md).
 
+## KCU116 differences
+
+The same application, built from the same sources, runs on the KCU116's MicroBlaze with one port
+(port 0). The differences are selected at compile time:
+
+* **Start-up.** The MicroBlaze start-up code leaves the caches off, so `main()` enables the
+  instruction and data caches first, then starts the timebase (`axi_timer_1`, both counters
+  cascaded into one 64-bit counter at 100 MHz). There is no VADJ step: the KCU116 fixes VADJ at
+  1.8 V.
+* **Si5328 before the transceivers.** The CMAC shim holds the transceivers and the CMAC in reset
+  from power-on (`CTRL.XCVR_RST` = 1). After programming the Si5328 (322.265625 MHz on CKOUT1),
+  the application releases that reset, waits for the transmit side to come out of reset, and
+  prints the shim's status line (`Port 0: CMAC at 0x44000000 configured: …, FEC RS(528,514)
+  (fixed) …`). The Taxi wrapper's transceiver reset sequencer needs the reference clock, so this
+  order matters.
+* **FEC is fixed** at RS(528,514) by the Taxi CMAC wrapper: `APP_FEC_MODE` is ignored, the `f` key
+  prints `FEC fixed on this target`, and the status line shows `cw corr n/a uncorr n/a` (the
+  wrapper has no RS-FEC counters).
+* **Link retry.** While the link is down, the application pulses the CMAC's receive reset every
+  2 seconds, and the Taxi wrapper also resets the CMAC receiver by itself after about 0.83 s
+  without alignment.
+* **Memory.** The application's code, data and stack live in the MicroBlaze's 256 KB local memory
+  (it uses about 83 % of it), so they can be embedded in the bitstream; the lwIP buffers and the
+  DMA rings (about 7 MB) are in DDR4.
+* **Speed.** The 100 MHz MicroBlaze makes everything that goes through software slower: the TCP
+  echo takes about 0.1 to 0.5 ms instead of 7 to 10 µs. The hardware echo, socket headers,
+  generator and checker are not affected.
+* **UART strings.** The lines the tests look for (`Port 0: link up, 100 Gb/s, FEC RS(528,514)`,
+  `Port 0: IP …`, `zircon_nic 1.3.0 at 0x440a0000 (port 0)`) are the same as on the VCK190.
+
 ## Building the Vitis workspace
 
 Follow the [build instructions](build_instructions.md#build-vitis-workspace). This command
@@ -108,7 +142,10 @@ builds the Vivado project first if needed, then the Vitis workspace, and gathers
 ```
 
 The result is `Vitis/boot/vck190_fmcp1/BOOT.BIN`, which contains the device image (PDI) and the
-application.
+application. For the KCU116, `./build.sh standalone --target kcu116` produces
+`Vitis/boot/kcu116/zircon_boot.bit`, the bitstream with the application embedded in the
+MicroBlaze's local memory (and `./build.sh all --target kcu116` also the QSPI image
+`zircon_boot.mcs`).
 
 ## Run the application
 
@@ -143,12 +180,24 @@ xsdb% device program Vitis/boot/vck190_fmcp1/BOOT.BIN
 Alternatively, open the workspace `Vitis/vck190_fmcp1_workspace` in the Vitis Unified IDE and run
 the `echo_server` application on the hardware.
 
+### On the KCU116
+
+Fit the [2x QSFP28 FMC] on the KCU116's **HPC** connector and connect the board's USB-UART and
+USB-JTAG ports. Then either load `Vitis/boot/kcu116/zircon_boot.bit` over JTAG, or program
+`zircon_boot.mcs` into the QSPI flash once and power-cycle the board: see
+[KCU116: bitstream and QSPI flash](build_instructions.md#kcu116-bitstream-and-qspi-flash). The
+echo server starts as soon as the FPGA is configured. Only QSFP port 0 is used.
+
 ## UART settings
 
 The console is the Versal PS UART0 at **115200 baud**, 8 data bits, no parity, 1 stop bit. The
 VCK190's USB-C connection exposes several serial ports; the Versal UART0 is normally the second
 one (`/dev/ttyUSB1` on a Linux PC). Use a terminal program such as [Putty] (Windows) or
 `picocom` / `minicom` (Linux).
+
+On the KCU116 the console is an AXI UART Lite in the FPGA, also at 115200 8N1, on the board's
+USB-UART (a CP2105 with two ports: use the **Enhanced** port, which is usually the second one,
+`/dev/ttyUSB1` on a Linux PC).
 
 ## Console output
 
@@ -319,6 +368,9 @@ byte.
 
 ## FEC mode
 
+On the KCU116 the FEC is fixed at RS(528,514) and cannot be changed (see
+[KCU116 differences](#kcu116-differences)); the rest of this section is about the VCK190.
+
 The MRMAC is built with **RS-FEC (clause 91, RS(528,514))**, which is what 100GBASE-CR4, SR4 and
 LR4 link partners expect. A partner set to FEC "auto" negotiates it.
 
@@ -393,6 +445,13 @@ For a complete automated test of all three services, see [Testing](testing.md)
 (`scripts/zircon_echo_test.py --port 1` tests port 1).
 
 ## Loopback test
+
+On the KCU116, which has one port, the tests need a QSFP28 loopback plug in port 0: `L 0` (or
+`l`, the same test on a one-port build) runs port 0's generator through the plug into its own
+checker at 100 Gb/s line rate, and `e` sends the generator's requests through the plug to port 0's
+own hardware echo. In `e` the requests and the replies share port 0's transmit path, so each gets
+half of the line, and at small payloads (64 B) the echo drops some requests for lack of transmit
+room. Measured results: [Testing](testing.md#loopback-plug-port-0-2026-09-25-19401954).
 
 The loopback test checks both ports at the full 100 Gb/s **without a 100G host**: connect a
 QSFP28 cable (DAC, AOC or optical) between **QSFP port 0 and QSFP port 1** of the FMC. Each
@@ -557,6 +616,17 @@ one. If requests are pipelined, coalesced or split into several segments, a samp
 for the echo that leaves while its request is being processed. The application does not
 attribute echoes that go out later (for example from lwIP's timers), but a single sample can
 then cover more than one request.
+
+On the **KCU116** the timestamps come from the CMAC shim instead of the MRMAC: the same 55-bit
+format and the same banks, but taken at the start of the frame at the CMAC's **client**
+interface, quantised to 4 ns. The latency there runs from the start of the request at the CMAC
+client interface to the start of the reply at the CMAC client interface, so it excludes the
+CMAC's own pipeline as well as the serdes, PCS and RS-FEC, and is **not directly comparable**
+with the VCK190's figures (see [KCU116 timestamps](design.md#timestamps-on-the-kcu116)). The
+`T` report says so in its header (`MAC-client SOF RX -> TX, zircon_cmac_us timestamps`), and the
+bring-up check reads the shim's timer (`Port 0: shim timestamp timer …`) instead of the MRMAC's.
+The software TCP echo on the 100 MHz MicroBlaze takes about 0.1 to 0.5 ms, so it lands in the
+upper doubling bins.
 
 ### The `T` command
 

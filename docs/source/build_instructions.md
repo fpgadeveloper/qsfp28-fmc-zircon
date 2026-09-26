@@ -22,7 +22,7 @@ The Vivado build cannot find the Zircon and Taxi sources without it.
 
 ## License requirements
 
-Two licenses are needed to build this design:
+For the **VCK190** (`vck190_fmcp1`), two licenses are needed:
 
 1. **Vivado Enterprise Edition** (or a 30-day evaluation license). The VCK190's XCVC1902 device is
    not supported by the free Vivado ML Standard Edition.
@@ -30,9 +30,16 @@ Two licenses are needed to build this design:
    AMD Xilinx Licensing site and installed. Without it, the implementation fails when the device
    image is generated.
 
-Zircon, Taxi and the Opsero glue logic are open source and need no license key. The other IP in
-the block design (CIPS, NoC, GT quad, AXI DMA, width converters, clocking wizards, AXI GPIO,
-AXI IIC, SmartConnect) ships with Vivado.
+For the **KCU116** (`kcu116`), one license is needed:
+
+1. **The UltraScale+ Integrated 100G Ethernet (CMAC) license.** It also costs nothing and is
+   generated from the AMD Xilinx Licensing site. The XCKU5P device itself is supported by the free
+   **Vivado ML Standard Edition**.
+
+Zircon, Taxi (including its CMAC wrapper) and the Opsero glue logic are open source and need no
+license key. The other IP in the block designs (CIPS, NoC, GT quad, MicroBlaze, DDR4 memory
+controller, GT wizard, AXI DMA, width converters, clocking wizards, AXI GPIO, AXI IIC, AXI UART
+Lite, AXI timers, SmartConnect) ships with Vivado. See [Licensing](licensing.md).
 
 ## Target designs
 
@@ -74,6 +81,13 @@ root of the repository (use `build.bat` instead of `./build.sh` from a plain Win
 
 ```
 ./build.sh all --target vck190_fmcp1
+```
+
+For the KCU116, the same command builds the bitstream, the echo server, the bitstream with the
+application embedded (`zircon_boot.bit`) and the QSPI flash image (`zircon_boot.mcs`):
+
+```
+./build.sh all --target kcu116
 ```
 
 The sections below describe each stage on its own.
@@ -136,18 +150,80 @@ Valid targets for the standalone application are:
 {% for design in data.designs if design.baremetal and design.publish %} `{{ design.label }}`{{ ", " if not loop.last else "." }} {% endfor %}
 
 The workspace is created in `Vitis/<target>_workspace` and the boot files
-are gathered in `Vitis/boot/<target>/`.
+are gathered in `Vitis/boot/<target>/`: `BOOT.BIN` for the VCK190, and for the KCU116
+`zircon_boot.bit`, the bitstream with the echo server embedded in the MicroBlaze's local memory.
 
 ### Build everything
 
 This builds everything that the target supports — the Vivado project and XSA
-and the standalone application — and gathers the boot images into
-`bootimages/*.zip`:
+and the standalone application, and for the KCU116 the QSPI flash image — and gathers the boot
+images into `bootimages/*.zip`:
 
 ```
 ./build.sh all --target <target>
 ./build.sh all --target all      # every target in the repo
 ```
+
+## KCU116: bitstream and QSPI flash
+
+The KCU116 has no SD boot for this design and no FSBL: the FPGA configures itself, either over
+JTAG or at power-on from its QSPI flash, and the MicroBlaze starts the echo server from its local
+memory straight away. `./build.sh all --target kcu116` produces, in `Vitis/boot/kcu116/` and in
+`bootimages/qsfp28-fmc-zircon_kcu116_standalone-2025-2.zip`:
+
+| File | What it is |
+|------|------------|
+| `zircon_boot.bit` | The bitstream with the echo server embedded (`updatemem`). Load it over JTAG. |
+| `zircon_boot.mcs` | The same bitstream as a QSPI flash image (128 MB, SPI x4), written by `./build.sh cfgmem --target kcu116` (part of `all`). |
+| `zircon_boot.prm` | The address map of the `.mcs`, for Vivado's flash programmer. |
+
+### Load over JTAG
+
+Connect the KCU116's USB-JTAG port, power the board and open the Vivado Hardware Manager: *Open
+Target → Auto Connect*, then *Program Device* with `Vitis/boot/kcu116/zircon_boot.bit`. The echo
+server starts as soon as the FPGA is configured. From the command line:
+
+```
+vivado -mode tcl
+open_hw_manager
+connect_hw_server
+open_hw_target
+set dev [lindex [get_hw_devices xcku5p*] 0]
+set_property PROGRAM.FILE Vitis/boot/kcu116/zircon_boot.bit $dev
+program_hw_devices $dev
+```
+
+To debug the application instead, program `Vivado/kcu116/kcu116.runs/impl_1/zircon_wrapper.bit`
+and run `Vitis/kcu116_workspace/echo_server/build/echo_server.elf` on the MicroBlaze from the
+Vitis IDE, or with xsdb (`fpga -f …`, `targets -set -filter {name =~ "MicroBlaze #*"}`, `dow …`,
+`con`).
+
+### Program the QSPI flash
+
+The KCU116's configuration flash is a Micron **MT25QU01G** (1 Gb, 128 MB). In the Vivado Hardware
+Manager, right-click the `xcku5p` device, choose *Add Configuration Memory Device* and select
+**`mt25qu01g-spi-x1_x2_x4`** (not `mt25qu256`, which Vivado rejects for this flash). Then program
+it with `zircon_boot.mcs` and `zircon_boot.prm` (erase, program, verify). From the command line,
+after the four `open_hw_manager` … `set dev` lines above:
+
+```
+create_hw_cfgmem -hw_device $dev [lindex [get_cfgmem_parts {mt25qu01g-spi-x1_x2_x4}] 0]
+set cfg [get_property PROGRAM.HW_CFGMEM $dev]
+set_property PROGRAM.FILES [list Vitis/boot/kcu116/zircon_boot.mcs] $cfg
+set_property PROGRAM.PRM_FILE Vitis/boot/kcu116/zircon_boot.prm $cfg
+set_property PROGRAM.ADDRESS_RANGE use_file $cfg
+set_property PROGRAM.ERASE 1 $cfg
+set_property PROGRAM.CFG_PROGRAM 1 $cfg
+set_property PROGRAM.VERIFY 1 $cfg
+create_hw_bitstream -hw_device $dev [get_property PROGRAM.HW_CFGMEM_BITFILE $dev]
+program_hw_devices $dev
+program_hw_cfgmem -hw_cfgmem $cfg
+```
+
+Programming the 12 MB image takes about five minutes. The board must be set to boot in master
+SPI mode (mode pins M[2:0] = 001, the KCU116's default as delivered; see the KCU116 user guide,
+UG1239). Power-cycle the board: it configures from the flash and prints the echo server's banner
+on the UART within a few seconds.
 
 ## Simulating `zircon_nic`
 
@@ -177,4 +253,9 @@ descriptors, a transmit reset with timestamps outstanding and snapshots taken un
 Two smaller testbenches cover the RX packer (`tb_mrmac_rx_packer.sv`) and the PTP units
 (`tb_ptp_units.sv`: the TX adapter's timestamp requests and the 1588 timer). It prints `ALL TESTS PASSED` and exits with status 0 on success.
 
-Both ports of the block design use the same `zircon_nic`, so one testbench covers both.
+Both ports of the block design, and both targets, use the same `zircon_nic`, so one testbench
+covers them all. For the KCU116, the script also runs `tb_zircon_cmac_us.sv`: the CMAC shim
+around Taxi's 100G CMAC wrapper in simulation mode (the testbench models the CMAC), covering its
+registers, the transceiver control bus, the receive and transmit timestamps and their clock
+crossings, the resets, and `zircon_nic` + shim running the generator → checker loop and the
+latency measurement.

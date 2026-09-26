@@ -1,20 +1,27 @@
-# qsfp28-fmc-zircon — design specification (zircon_nic 1.3.0, target `vck190_fmcp1`)
+# qsfp28-fmc-zircon — design specification (zircon_nic 1.3.0, targets `vck190_fmcp1` and `kcu116`)
 
-This is the engineering contract of the design: the RTL (`Vivado/src/hdl/`), the block design
-(`Vivado/src/bd/bd_versal.tcl`) and the bare-metal software (`Vitis/common/src/`) implement it,
-and it must describe what they do now. Change it in the same commit as the sources. It is not
-user documentation: the user guide is the Sphinx site in `docs/source/` (hosted at
-<https://qsfp28-zircon.ethernetfmc.com>); `registers.md` and `design.md` there are kept
-consistent with §3.3 and §6.
+This is the engineering contract of the design: the RTL (`Vivado/src/hdl/`), the block designs
+(`Vivado/src/bd/bd_versal.tcl`, `Vivado/src/bd/bd_microblaze.tcl`) and the bare-metal software
+(`Vitis/common/src/`) implement it, and it must describe what they do now. Change it in the same
+commit as the sources. It is not user documentation: the user guide is the Sphinx site in
+`docs/source/` (hosted at <https://qsfp28-zircon.ethernetfmc.com>); `registers.md` and
+`design.md` there are kept consistent with §3.3, §6, §6b and §6c.
 
 ## 1. Scope
 
-Two 100 GbE ports on the Opsero **2x QSFP28 FMC (OP120)** on the VCK190's FMCP1 connector. Each
-QSFP28 port has its own **Versal Integrated MRMAC** hard block (1x100GE CAUI-4, 4x GTY at
-25.78125 Gb/s, **RS-FEC clause 91, RS(528,514)**) and its own **`zircon_nic`**, a block-design
-module reference built around the **Taxi Zircon IP stack**. Per port, `zircon_nic` offers:
+100 GbE on the Opsero **2x QSFP28 FMC (OP120)**, on two targets that share `zircon_nic`, its
+register map and the bare-metal application:
 
-- **UI0 "raw"**: complete Ethernet frames (no FCS) to and from the PS through an AXI DMA
+| target | board / connector | QSFP ports | MAC | processor | boot |
+|---|---|---|---|---|---|
+| `vck190_fmcp1` | VCK190 (XCVC1902), FMCP1 | 0 and 1 | per port a **Versal Integrated MRMAC** hard block (§6) | Versal PS (Cortex-A72) | `BOOT.BIN` (SD card) or JTAG |
+| `kcu116` | KCU116 (XCKU5P-FFVB676-2-E), HPC | 0 only (the KCU116 HPC wires FMC DP0-3 only) | the KU5P's **CMACE4** hard block through Taxi's `taxi_eth_mac_100g_us` wrapper, behind the MIT shim `zircon_cmac_us` (§6b, §6c) | MicroBlaze, 100 MHz | `zircon_boot.bit` over JTAG, or `zircon_boot.mcs` from QSPI |
+
+Each port is 1x100GE CAUI-4 on 4x GTY at 25.78125 Gb/s with **RS-FEC clause 91, RS(528,514)**,
+and has its own **`zircon_nic`**, a block-design module reference built around the **Taxi Zircon
+IP stack**. Per port, `zircon_nic` offers:
+
+- **UI0 "raw"**: complete Ethernet frames (no FCS) to and from the processor through an AXI DMA
   (`axi_dma_raw[_1]`). Carries everything the hardware rules do not claim (ARP, ICMP, DHCP, TCP,
   broadcasts, UDP to other ports); the bare-metal application runs lwIP on it.
 - **UI1 "hardware UDP echo"**: IPv4/UDP datagrams to `ECHO_PORT` (default 7) are answered by
@@ -27,24 +34,32 @@ module reference built around the **Taxi Zircon IP stack**. Per port, `zircon_ni
   sequence number and a pseudo-random payload, and a checker that claims datagrams to
   `CHK_PORT` (default 5001) and counts sequence, bit and length errors, both entirely in logic.
   **Rate meters** latch RX/TX frames and bytes once a second.
-- **Latency measurement** (§11): the MRMAC's IEEE 1588 two-step timestamps, RX PCS of a request
-  to TX PCS of its reply, for the hardware echo (bank 0) and for software replies on UI0
-  (bank 1), with per-bank statistics and a 64-bin histogram.
+- **Latency measurement** (§11): TX timestamp of a reply − RX timestamp of its request, for the
+  hardware echo (bank 0) and for software replies on UI0 (bank 1), with per-bank statistics and
+  a 64-bin histogram. On the vck190 the timestamps are the MRMAC's IEEE 1588 two-step
+  timestamps (RX PCS → TX PCS); on the kcu116 they are fabric timestamps taken by the shim at
+  the MAC-client interface (§11.7).
 
-**There is no processor in the datapath** of UI1, the generator or the checker. The PS runs one
-bare-metal application (`echo_server`, §8) that is the control plane: it powers the FMC,
-programs the Si5328, brings the MRMACs up, configures `zircon_nic`, runs lwIP on UI0, bounces
-the socket demo's payloads and drives the loopback and latency tests.
+**There is no processor in the datapath** of UI1, the generator or the checker. The processor
+(the Versal PS, or the MicroBlaze on the kcu116) runs one bare-metal application (`echo_server`,
+§8) that is the control plane: it powers the FMC (vck190), programs the Si5328, brings the MACs
+up, configures `zircon_nic`, runs lwIP on UI0, bounces the socket demo's payloads and drives the
+loopback and latency tests.
 
 Zircon and the Taxi library are used **unmodified** from `submodules/taxi` (pinned at
-`cc70b27`, CERN-OHL-S-2.0). Everything Zircon does not provide at that commit (header
-truncation, rule matching and dispatch, header strip, socket descriptor, TX metadata, the UDP
-checksum workaround, generator, checker, rate meters, latency measurement, registers, counters)
-is Opsero MIT glue in `Vivado/src/hdl/`, or software.
+`cc70b27`, CERN-OHL-S-2.0). That includes Taxi's 100G CMAC wrapper and its IP-generation
+scripts on the kcu116. Everything Taxi does not provide at that commit (header truncation, rule
+matching and dispatch, header strip, socket descriptor, TX metadata, the UDP checksum
+workaround, generator, checker, rate meters, latency measurement, registers, counters, the MRMAC
+adapters and the CMAC shim with its timestamps) is Opsero MIT glue in `Vivado/src/hdl/`, or
+software.
 
-`config/data.json` is the manifest: one target, `vck190_fmcp1`, with `ports: 2` and `fec: "rs"`.
-The block design also builds `ports: 1` (port 0 only) and `fec: "none"` (MRMAC FEC bypassed);
-neither is a published target.
+`config/data.json` is the manifest with two targets: `vck190_fmcp1` (`ports: 2`, `fec: "rs"`,
+`bdscript: "versal"`, group `versal`) and `kcu116` (`ports: 1`, `fec: "rs"`, `bdscript:
+"microblaze"`, group `fpga`, `cfgmem: true`, `flashsize: "128"`, `flashintf: "SPIx4"`). The
+Versal block design also builds `ports: 1` (port 0 only) and `fec: "none"` (MRMAC FEC bypassed);
+neither is a published target. `bd_microblaze.tcl` accepts only `ports { 0 }`, and `fec` is
+fixed at `rs` there.
 
 Design decisions that explain the current shape:
 
@@ -58,9 +73,47 @@ Design decisions that explain the current shape:
 - **No automatic FEC fallback in software.** In a port 0 ↔ port 1 loopback both ports must stay
   in RS-FEC; a port that had fallen back to FEC off while waiting for a link would never link to
   the other. `FEC_FALLBACK_MS` exists but defaults to 0; the console key `f` cycles the mode by
-  hand.
+  hand (vck190 only).
+- **kcu116: Taxi's CMAC wrapper, not AMD's example design.** The UltraScale+ `cmac_usplus` IP is
+  used through `taxi_eth_mac_100g_us` (with its own GT wrappers, reset sequencer, watchdog and
+  IP-generation scripts), so the kcu116 datapath is Taxi end to end and the Taxi sources stay
+  unmodified. That wrapper, at `cc70b27`, hard-wires RS-FEC on and **does not implement PTP
+  timestamps** (the ports exist, the outputs are never driven), so the shim takes its own
+  timestamps in logic (§6c) and `zircon_nic` stays unchanged.
+- **kcu116: the zircon core stays on a free-running 300 MHz clock.** The MAC side of
+  `zircon_nic` runs directly on the CMAC `tx_clk` / `rx_clk` (its MAC-side async FIFOs already
+  separate those domains). Running the core on `tx_clk` was rejected: that clock only exists
+  while the GT is up (not before the Si5328 is programmed, not during a GT reset), so UI ↔ core
+  handshakes would stall, and `CORE_HZ` and the rate meters would change meaning. 300 MHz keeps
+  §10.5 unchanged; 250 MHz would not be enough (RX needs 31 cycles against 30.8 available for a
+  1514-byte frame).
+
+### 1.1 Known limitations of the kcu116 target
+
+- **One port.** The KCU116 HPC connector wires FMC DP0-3 only (one GTY quad, bank 227), so only
+  QSFP28 port 0 exists; the QSFP1 module is held in reset and low-power mode by constants. The
+  KU5P also has only one CMAC (CMACE4_X0Y0).
+- **No cross-port loopback.** With one port there is no port-to-port cable test. On a QSFP28
+  loopback plug in port 0, `L 0` (and `l`, the same test on a one-port build) runs 100 Gb/s line
+  rate, and `e` echoes through the plug with requests and replies sharing port 0's transmit path
+  (half the line each; at 64 B the echo drops ~0.05 % for lack of transmit room). Bench-run
+  2026-09-25 19:40–19:54, §12.8.1.
+- **FEC not switchable.** RS(528,514) is hard-wired in the Taxi wrapper: `APP_FEC_MODE` is
+  ignored, the `f` key only prints `FEC fixed on this target`, and there are no RS-FEC codeword
+  counters (the status line prints `cw corr n/a uncorr n/a`). The partner must run RS-FEC.
+- **Maximum frame length not configurable.** The CMAC's maximum frame length is the static IP
+  default: Taxi's `cfg_tx/rx_max_pkt_len` ports are not connected to the CMAC. 9000-byte
+  payloads (9046-byte frames with FCS) were **verified on the loopback plug** (`L 0` at line
+  rate, `e`, paced echoes; 0 errors, §12.8.1), so the limit is ≥ 9046 bytes; the exact value
+  (believed 9600) was not probed. Jumbo frames were not tested against a host (MTU 1500).
+- **Latency figures are not comparable with the vck190's** (MAC-client SOF → SOF instead of
+  PCS → PCS, 4 ns quantisation; §11.7).
+- **Software TCP echo** runs on a 100 MHz MicroBlaze: ~0.1–0.5 ms per exchange instead of
+  7–10 µs on the A72 (§12.8). The hardware paths are unaffected.
 
 ## 2. Clocks, widths, domains
+
+### 2.1 `vck190_fmcp1`
 
 | domain | clock | width | blocks |
 |---|---|---|---|
@@ -102,6 +155,36 @@ valid beats follow a TLAST beat, and the beat the MRMAC offered then was lost (s
 as a frame cut at 48 bytes merged with the next). On TX, where the MRMAC does back-pressure, the
 path is `axis_dwidth_converter` 64 → 48 bytes + `mrmac_tx_axis_adapter` (lanes, PTP sideband).
 
+### 2.2 `kcu116`
+
+| domain | clock | width | blocks |
+|---|---|---|---|
+| system / UI / DMA / AXI-Lite (`sys_clk`) | `ddr4_0/addn_ui_clkout1`, 100 MHz | 512 b streams, 32-bit AXI-Lite | MicroBlaze, peripheral SmartConnect `aclk`, both AXI DMAs (lite, SG, MM2S, S2MM), zircon_nic `ui_clk`, GPIO / IIC / UART Lite / timers, DDR SmartConnect slave side (`aclk1`) |
+| DDR4 controller | `ddr4_0/c0_ddr4_ui_clk`, 333.25 MHz (MIG preset `ddr4_sdram_075`) | — | DDR SmartConnect `axi_smc` master side only |
+| zircon_nic core (`clk`) | `clk_wiz_0/clk_out1`, 300 MHz | 512 b | as on the vck190 (`CORE_HZ` 300000000 unchanged) |
+| timestamp timebase (`ts_clk`) | `clk_wiz_0/clk_out2`, 250 MHz | 45-bit tick counter | shim timebase (§6c) |
+| control (`ctrl_clk`) | `clk_wiz_0/clk_out3`, 125 MHz | 32-bit AXI-Lite, 16-bit APB | shim `ctrl_clk`: Taxi `xcvr_ctrl_clk` (GT free-run / DRP, APB), shim `s_axi` (peripheral SmartConnect `aclk1`) |
+| CMAC TX (`tx_clk`) | shim output: Taxi `tx_clk` (BUFG_GT, TXPROGDIVCLK), 322.265625 MHz | 512 b | zircon_nic `mac_tx_clk`, shim TX side |
+| CMAC RX (`rx_clk`) | shim output: Taxi `rx_clk` (lane 0 recovered clock, BUFG_GT), 322.265625 MHz nominal | 512 b | zircon_nic `mac_rx_clk`, shim RX side |
+| GT reference | Si5328 CKOUT1 → GBTCLK0 → K7/K6, `IBUFDS_GTE4` inside the shim, 322.265625 MHz | — | QPLL0 of GTY bank 227 |
+
+`clk_wiz_0` is one MMCM fed by `sys_clk` (`PRIM_SOURCE No_buffer`, VCO 1500 MHz: D 1, M 15,
+dividers 5 / 6 / 12), reset by `rst_ddr4_0_100M/peripheral_reset`. Taxi requires the 125 MHz
+`xcvr_ctrl_clk` (its GT wizard `FREERUN_FREQUENCY` and the CMAC `GT_DRP_CLK` are 125). The
+vck190's 390.625 MHz `axis_clk`, the RX packer, `tx_dwidth` and `mrmac_tx_axis_adapter` do not
+exist on this target: the CMAC client is already 512-bit Taxi-convention AXI-Stream, and the TX
+/ RX clock difference is absorbed by zircon_nic's two MAC-side async FIFOs. The CMAC client, like
+the MRMAC's, has no RX back-pressure (Taxi `m_axis_rx` comes straight from the CMAC; `tuser[0]`
+= error on the last beat). `mac_rx_pack_stat` is tied to 0, so STATUS b4 / b5 read 0.
+
+Resets (`proc_sys_reset`, `ext_reset_in` = board `reset` pushbutton, `dcm_locked` =
+`clk_wiz_0/locked` for the three MMCM clocks): `rst_ddr4_0_100M` (board / MicroBlaze automation;
+DMAs, peripherals, zircon_nic `ui_aresetn`), `rst_core_300M` (zircon_nic `aresetn`),
+`rst_ts_250M` (shim `ts_aresetn`), `rst_ctrl_125M` (shim `ctrl_aresetn`); the MIG automation adds
+`rst_ddr4_0_333M`. zircon_nic's `mac_rx_aresetn` / `mac_tx_aresetn` come from the shim (§6c):
+low while Taxi's `rx_rst_out` / `tx_rst_out`, `CTRL.XCVR_RST` or `ctrl_aresetn` is asserted,
+released synchronously in `rx_clk` / `tx_clk`.
+
 ## 3. `zircon_nic`
 
 Verilog shell `Vivado/src/hdl/zircon_nic.v` (a block-design module reference needs a `.v` top)
@@ -123,14 +206,14 @@ module zircon_nic #(
     C_S_AXI_ADDR_WIDTH = 12      // must be 12
 )(
     clk, aresetn,                                   // core, 300 MHz
-    mac_rx_clk, mac_rx_aresetn,                     // 390.625 MHz
+    mac_rx_clk, mac_rx_aresetn,                     // vck190 390.625 MHz; kcu116 CMAC rx_clk 322.265625 MHz
     s_axis_mac_rx_{tdata[511:0], tkeep[63:0], tvalid, tready, tlast},
     s_axis_mac_rx_tuser[48:0],                      // [0] bad frame (last beat), [48:1] RX timestamp ts[54:7]
-    mac_rx_pack_stat[1:0],                          // mrmac_rx_packer: [0] stalled, [1] beats dropped
-    mac_tx_clk, mac_tx_aresetn,                     // 390.625 MHz
+    mac_rx_pack_stat[1:0],                          // mrmac_rx_packer: [0] stalled, [1] beats dropped (kcu116: 0)
+    mac_tx_clk, mac_tx_aresetn,                     // vck190 390.625 MHz; kcu116 CMAC tx_clk 322.265625 MHz
     m_axis_mac_tx_{tdata, tkeep, tvalid, tready, tlast}, m_axis_mac_tx_tuser[0:0] (always 0),
     m_axis_tx_ptp_{tdata[23:0], tvalid, tready},    // one {tag, 1588 op} record per TX frame (§11.3)
-    tx_ptp_tstamp_in[54:0], tx_ptp_tstamp_tag_in[15:0], tx_ptp_tstamp_valid_in,   // from the MRMAC
+    tx_ptp_tstamp_in[54:0], tx_ptp_tstamp_tag_in[15:0], tx_ptp_tstamp_valid_in,   // from the MRMAC / the CMAC shim
     ui_clk, ui_aresetn,                             // 100 MHz
     m_axis_raw_rx_*,  s_axis_raw_tx_*,              // UI0, {tdata, tkeep, tvalid, tready, tlast}
     m_axis_sock_rx_*, s_axis_sock_tx_*,             // UI2
@@ -283,7 +366,7 @@ capacity (xsim-measured): max(18, ⌈F/64⌉ + 1) core cycles per packet, F = fr
 | 0x000 | ID | R | `0x5A495243` ("ZIRC") |
 | 0x004 | VERSION | R | `0x00010300` = 1.3.0 (bits 23:16 major, 15:8 minor, 7:0 patch; earlier values in §13) |
 | 0x008 | CTRL | RW | b0 RX_EN, b1 TX_EN, b2 ECHO_EN, b3 SOCK_EN, b4 PROMISC (reserved, no effect: frames for other MACs always go RAW), b31 STAT_CLR (write 1 with byte lane 3: zeroes the counters in every clock domain; reads 0). b4:0 are written with byte lane 0. |
-| 0x00C | STATUS | R/W1C | b0 RX_FIFO_OVF (sticky, W1C: the MAC-side FIFO dropped a frame), b1 TX_UNDERRUN (always 0: the MAC-side TX FIFO is a frame FIFO), b2 RX_META_ERR, b3 TX_META_ERR (RO, sticky until reset: internal len-metadata FIFO overflow, must never be set), b4 RX_PACK_STALL (sticky, W1C: the packer output saw tready low; expected only around a MAC-side reset), b5 RX_PACK_OVF (sticky, W1C: the packer dropped beats; the frames concerned were delivered as bad) |
+| 0x00C | STATUS | R/W1C | b0 RX_FIFO_OVF (sticky, W1C: the MAC-side FIFO dropped a frame), b1 TX_UNDERRUN (always 0: the MAC-side TX FIFO is a frame FIFO), b2 RX_META_ERR, b3 TX_META_ERR (RO, sticky until reset: internal len-metadata FIFO overflow, must never be set), b4 RX_PACK_STALL (sticky, W1C: the packer output saw tready low; expected only around a MAC-side reset), b5 RX_PACK_OVF (sticky, W1C: the packer dropped beats; the frames concerned were delivered as bad). b4 / b5 always read 0 on the kcu116 (no packer; `mac_rx_pack_stat` tied 0) |
 | 0x010 | MAC_LO | RW | local MAC bytes 0..3 (byte 0, first on the wire, in bits 7:0) |
 | 0x014 | MAC_HI | RW | local MAC bytes 4..5 in bits 15:0 |
 | 0x018 | IPV4 | RW | local IPv4, first octet in bits 31:24 (192.168.10.2 = 0xC0A80A02) |
@@ -386,6 +469,33 @@ The TB builds a second snapshot with `GEN_EN` = 0 and runs tests 9, 1, 3, 5, 44 
 FIFO overflow, and the RX timestamp on every output beat). `tb_ptp_units.sv` covers the TX
 adapter's PTP sideband (23) and `ptp_systimer` (24).
 
+`run_xsim.sh` also builds `tb_zircon_cmac_us.sv`, the kcu116 shim (§6c) around Taxi's
+`taxi_eth_mac_100g_us` with `SIM` = 1, whose sources it expands from Taxi's `.f` lists as the
+Vivado flow does (§7.1). Taxi's SIM mode drops the GT and CMAC IP but does **not** loop TX to RX:
+it leaves the GT user clocks (`gt_txoutclk` / `gt_rxoutclk` of every lane) and the wrapper's
+internal CMAC client interfaces undriven, and Taxi's own cocotb benches drive them
+hierarchically. The TB does the same with xsim `force` and models the CMAC (TX tready always /
+random / shaped to 100 Gb/s, an optional TX → RX loop with a fixed delay across unrelated clocks,
+injected RX frames). Without the CMAC the shim substitutes: RX_GOOD_PKTS = error-free RX frames,
+TX_GOOD_PKTS = frames accepted, RX_BAD_FCS and RX_HIGH_BER = 0, RX_BLOCK_LOCK = RX_STATUS, a
+1250-cycle (×100) clock window, and `IBUFDS_GTE4` bypassed. `taxi_eth_phy_10g_usxgmii_an.sv`
+(pulled in by the `.f` list, unused by the 100G wrapper) does not compile in xsim (VRFC 10-3400)
+and is left out of the simulation list only.
+
+| test | checks |
+|---|---|
+| 101 | register defaults (ID, VERSION, CTRL 0x31, TS_INCR, STICKY); `mac_*_aresetn` low and GT APB answering SLVERR while XCVR_RST is set; release → TX_RST_OUT / RX_RST_OUT clear, RX_STATUS, `link_up`, `mac_*_aresetn` high |
+| 102 | AXI-Lite → `taxi_axil_apb_adapter` → the wrapper's GT APB registers: 32- and 16-bit accesses, lane address split, a 16-bit write leaves the neighbouring 16-bit register alone |
+| 103 | TS_NOW advances at 1 ns/ns (LO latches HI); TX_CLK_KHZ / RX_CLK_KHZ match the model clocks |
+| 104 | injected RX frames (1..40 beats, error flags, gaps): data unchanged, `tuser[48:1]` on every beat = the first-beat timestamp, within the `ts_gray_sync` window of the true arrival time; counters |
+| 105 | op 2'b10 records (queued ahead, in the SOF cycle, several frames ahead), op 0 records, random CMAC tready: one return per op-2 frame one cycle after the SOF handshake, right tag and time; none for op 0 |
+| 106 | a frame without a record goes out untagged and intact, STICKY.PTP_UNDERRUN set, W1C clears it |
+| 107 | TX → RX loop at three RX periods / phases: \|(RX ts − TX ts) − true delay\| ≤ 8 ns for every frame |
+| 108 | (monitors over the whole run) every `ts_gray_sync` output monotonic, +0/+1 per cycle (+2/3 in `ctrl_clk`), lag spread ≤ 8 ns per domain and across TX and RX |
+| 109 | CTRL.RX_RST → `mac_rx_aresetn` low, STICKY.LINK_LOST; CTRL.TX_RST → `mac_tx_aresetn` low; recovery |
+| 110 | zircon_nic + shim, `mac_tx_clk` ≠ `mac_rx_clk`, CMAC TX shaped to 100 Gb/s and looped: 200 generated 1472-byte datagrams checked, no errors, drops or PTP underrun |
+| 111 | 20 UDP echo requests with LAT_CTRL.EN: bank 0 COUNT 20, MIN / MAX within 8 ns of the true RX-first-beat → TX-SOF delays, LAT_STATUS 0 |
+
 ## 4. Metadata handling (Zircon formats, Taxi `cc70b27`)
 
 The parser output and deparser input are 16 beats × 64 bit (128 bytes). Byte layout
@@ -440,7 +550,7 @@ descriptor, at least 1 byte; the frame must fit the partner's MTU, 8972 bytes fo
 MTU); the headers come from the SOCK_* registers. A UI0 / UI2 TX transfer longer than
 MAX_TX_BYTES (9618) is dropped by `tx_len_guard` and counted in TX_OVERSIZE_DROP.
 
-## 6. Block design (`Vivado/src/bd/bd_versal.tcl`, bd name `zircon`)
+## 6. Block design, vck190 (`Vivado/src/bd/bd_versal.tcl`, bd name `zircon`)
 
 Derived from the VCK190 block design of the 2x-qsfp28-fmc reference design (`bd_versal.tcl`,
 branch dev-yocto @3852c57): CIPS, NoC / DDR4, the MRMAC + `gt_quad_base` per QSFP port with its
@@ -539,26 +649,271 @@ IIC offsets are those of 2x-qsfp28-fmc's port 0.
 The MRMACs and `zircon_nic` have no interrupt outputs. The bare-metal application is fully
 polled and uses none of them.
 
+## 6b. Block design, kcu116 (`Vivado/src/bd/bd_microblaze.tcl`, bd name `zircon`)
+
+A pure-FPGA MicroBlaze system. Its skeleton follows the bare-metal MicroBlaze block design of
+ethernet-fmc-taxi-eth (`bd_mb-us.tcl`) and the KCU116 board-automation names of the
+2x-qsfp28-fmc design (`bd_mb.tcl`); the MRMAC, packer and adapters of §6 are replaced by one
+module reference, `zircon_cmac_0` (§6c). `build.tcl` passes `ports { 0 }` and `fec rs`; any other
+port list is an error. No interrupt controller and no interrupt nets: the application is fully
+polled.
+
+```
+zircon_cmac_0 m_axis_mac_rx (512 b, rx_clk, tuser 49 b) ─ zircon_nic_0.s_axis_mac_rx
+zircon_nic_0.m_axis_mac_tx  (512 b, tx_clk)             ─ zircon_cmac_0.s_axis_mac_tx
+zircon_nic_0.m_axis_tx_ptp                              → zircon_cmac_0.s_axis_tx_ptp
+zircon_cmac_0 tx_ptp_tstamp_out / _tag_out / _valid_out → zircon_nic_0 tx_ptp_tstamp_in / _tag_in / _valid_in
+const_pack_stat (2'b00)                                 → zircon_nic_0.mac_rx_pack_stat
+zircon_nic_0.m_axis_raw_rx  → axi_dma_raw  S2MM ┐  (SG, 512-bit, 100 MHz, axi_smc → DDR4)
+zircon_nic_0.s_axis_raw_tx  ← axi_dma_raw  MM2S ┘
+zircon_nic_0.m_axis_sock_rx → axi_dma_sock S2MM ┐
+zircon_nic_0.s_axis_sock_tx ← axi_dma_sock MM2S ┘
+zircon_cmac_0.link_up → grn_led_qsfp0, and through an inverter → red_led_qsfp0
+```
+
+| cell | configuration |
+|---|---|
+| `ddr4_0` | MIG, board automation: `default_sysclk1_300` → `C0_SYS_CLK`, `ddr4_sdram_075` → `C0_DDR4` (32-bit, 1 GB, `c0_ddr4_ui_clk` 333.25 MHz), `ADDN_UI_CLKOUT1_FREQ_HZ` 100 (= `sys_clk`), board `reset` (CPU_RESET, active high) → `sys_rst` |
+| `microblaze_0` | automation `axi_intc {0}`, `cache {32KB}`, `debug_module {Debug Only}` (`mdm_1`), `local_mem {128KB}`, then both LMB controllers grown to **256 KB** with `assign_bd_address -range 256K`. No MMU, no FPU; barrel shifter, divider, `C_USE_HW_MUL` 2, the exceptions the standalone BSP expects, `C_PVR` 2. 32 KB I- and D-cache; the D-cache is write-through (so `C_DCACHE_VICTIMS` is ignored by the IP: a warning only). Cached DDR through `axi_smc` |
+| `axi_smc` | DDR SmartConnect: `NUM_SI` 8 (S00 MicroBlaze DC, S01 IC, S02..S04 `axi_dma_raw` SG / MM2S / S2MM, S05..S07 `axi_dma_sock` SG / MM2S / S2MM), `NUM_MI` 1 → `ddr4_0/C0_DDR4_S_AXI`, `NUM_CLKS` 2 (`aclk` = `c0_ddr4_ui_clk`, `aclk1` = `sys_clk`) |
+| `microblaze_0_axi_periph` | peripheral SmartConnect on `M_AXI_DP`: `NUM_MI` 10, `NUM_CLKS` 2 (`aclk` 100 MHz, `aclk1` 125 MHz for the shim). M00 `zircon_cmac_0`, M01 `axi_dma_raw`, M02 `axi_dma_sock`, M03 `zircon_nic_0`, M04 `axi_gpio_qsfp0`, M05 `axi_iic_qsfp0`, M06 `axi_iic_clk`, M07 `axi_uartlite_0`, M08 `axi_timer_0`, M09 `axi_timer_1` |
+| `clk_wiz_0` | MMCM 300 / 250 / 125 MHz from `sys_clk` (§2.2) |
+| `rst_core_300M`, `rst_ts_250M`, `rst_ctrl_125M` | `proc_sys_reset` per MMCM clock (§2.2) |
+| `zircon_cmac_0` | module reference `zircon_cmac_us` (§6c), `FAMILY kintexuplus`, `CFG_LOW_LATENCY 0`, polarities 0 |
+| `zircon_nic_0` | module reference `zircon_nic` (§3), default parameters (`DATA_W` 512, `GEN_EN` 1, `CORE_HZ` 300000000) |
+| `axi_dma_raw`, `axi_dma_sock` | as on the vck190 (SG, no status/control stream, 512-bit MM and stream, DRE, 64-beat bursts, 26-bit length) but `c_addr_width` 32. The 512-bit MM width is required: the stream width cannot exceed it |
+| `axi_gpio_qsfp0` | CH1 3 outputs, reset 0x2 (b0 ModSelL, b1 ResetL, b2 LPMode); CH2 2 inputs (b0 ModPrsL, b1 IntL) |
+| `axi_iic_qsfp0`, `axi_iic_clk` | QSFP0 module management; FMC Si5328 (I2C 0x68) |
+| `axi_uartlite_0` | console, board interface `rs232_uart`, 115200 8N1 (fixed in the IP: nothing to program) |
+| `axi_timer_0` | xiltimer's sleep timer (`usleep()` / `sleep()`); selected by name in `pre_platform_build.py` |
+| `axi_timer_1` | the application's free-running 64-bit timebase (cascade mode, set up by software, §8.2) |
+| QSFP1 constants | `modsell_qsfp1` = 1, `resetl_qsfp1` = 0, `lpmode_qsfp1` = 1, `grn/red_led_qsfp1` = 0: the QSFP1 module is held in reset and low power |
+
+There is no `axi_quad_spi`: the FPGA configures itself from the QSPI flash and Vivado programs
+the flash (§7.1). There is no VADJ control: the KCU116 fixes VADJ at 1.8 V, and all FMC I/O is
+LVCMOS18.
+
+**Address map (MicroBlaze `Data` / `Instruction`, 32-bit).** Every segment is pinned with
+`assign_bd_address -offset -range -force`: `zircon_cmac_0` and `zircon_nic_0` are module
+references and get no `XPAR_` macros, so `hw_config.h` has them as fixed fallback addresses.
+
+| base | size | cell |
+|---|---|---|
+| 0x0000_0000 | 256 KB | LMB (`ilmb` / `dlmb` BRAM controllers) |
+| 0x4000_0000 | 64 KB | `axi_uartlite_0` |
+| 0x41C0_0000 | 64 KB | `axi_timer_0` |
+| 0x41C1_0000 | 64 KB | `axi_timer_1` |
+| 0x4400_0000 | 512 KB | `zircon_cmac_0` (registers +0x0_0000, GT APB +0x4_0000; §6c) |
+| 0x4408_0000 | 64 KB | `axi_dma_raw` |
+| 0x4409_0000 | 64 KB | `axi_dma_sock` |
+| 0x440A_0000 | 4 KB | `zircon_nic_0` |
+| 0x440B_0000 | 64 KB | `axi_gpio_qsfp0` |
+| 0x440C_0000 | 64 KB | `axi_iic_qsfp0` |
+| 0x4410_0000 | 64 KB | `axi_iic_clk` (Si5328) |
+| 0x8000_0000 | 1 GB | `ddr4_0` `C0_DDR4_ADDRESS_BLOCK`, also mapped in the SG / MM2S / S2MM spaces of both DMAs |
+
+The +0x8 / +0x9 / +0xA offsets inside the 0x4400_0000 block match port 0's layout on the vck190;
+the vck190's +0x0 MRMAC slot holds the CMAC shim.
+
+**Synthesis.** The block design stays in the default out-of-context (hierarchical) mode. The
+`zircon_cmac_0` module-reference OOC run synthesises `cmac_usplus` inline (Taxi's IP script sets
+`generate_synth_checkpoint false`) and treats the four GT wizards as black boxes, filled from
+their own OOC checkpoints at link. The CMAC IP's LOC xdc, which Taxi's script disables, is still
+parsed in that OOC run; it names the same CMACE4_X0Y0, so it is harmless. `create_clock
+gt_ref_clk_0` in `kcu116.xdc` raises no duplicate-clock warning (the wizards' refclk clocks
+exist only out of context).
+
+**Constraints (`Vivado/src/constraints/kcu116.xdc`).**
+
+- Pins from 2x-qsfp28-fmc's proven `kcu116.xdc`, all LVCMOS18: Si5328 I2C Y17 / AA17; QSFP0 I2C
+  AB17 / AC17; refclk `gt_ref_clk_0_clk_p` K7 (GBTCLK0, bank 227); GTY lanes (TX p / RX p) F7 / D2,
+  E5 / C4, D7 / B2, B7 / A4; QSFP0 ModSelL AA20, ResetL AB20, ModPrsL AC22, IntL AC23, LPMode Y18,
+  LEDs AD16 / AE16; QSFP1 ModSelL AB24, ResetL AC24, LPMode AA18, LEDs AE17 / AF17. GT lanes are
+  in order with no polarity inversion (CAUI-4 lane reordering is the CMAC's job). The
+  XCKU5P-FFVB676-2-E's GTYs run 25.78125 Gb/s here, although the board catalog lists "16.5 Gb/s
+  max" for the device (the catalog entry is wrong; Taxi's RK_XCKU5P_F example and the KCU116's
+  own SFP28 cages also run 25.78 Gb/s).
+- `create_clock -period 3.103 -name gt_ref_clk_0` on the refclk port (the `IBUFDS_GTE4` is in
+  the shim RTL; no IP creates this clock).
+- `LOC CMACE4_X0Y0` on the CMACE4 cell: Taxi's IP script disables the `cmac_usplus` LOC xdc; the
+  GT channels follow the package pins.
+- `USER_CLOCK_ROOT X3Y3` (the CMACE4_X0Y0 clock region) on the output nets of Taxi's four
+  `bufg_gt_rxusrclk_inst` buffers. The CMAC checks the skew between its four RX_SERDES_CLK inputs
+  (max 1.0 ns); lane 0's RX clock is also the whole `rx_clk` fabric domain, its root landed in
+  X2Y2 and the check failed (1.342 ns). A `CLOCK_DELAY_GROUP` is ignored by the placer here
+  ([Place 30-898]: the four buffers have no common driver).
+- False paths to / from the QSFP sideband, LED and I2C ports.
+- **No `set_clock_groups -asynchronous`**: it would override the `set_max_delay -datapath_only`
+  and `set_bus_skew` constraints that Taxi's CDC scripts and `zircon_cmac_us.tcl` put on every
+  crossing.
+- Bitstream: `COMPRESS TRUE`, `CONFIGRATE 31.9`, `SPI_BUSWIDTH 4`, `SPI_FALL_EDGE YES`,
+  `SPI_32BIT_ADDR YES`. The 2x-qsfp28-fmc value `CONFIGRATE 33` is not a legal UltraScale+ rate
+  (CRITICAL WARNING [Netlist 29-154]); 31.9 is the nearest legal rate below it.
+- `Vivado/src/constraints/zircon_cmac_us.tcl` (MIT, implementation only, cells found by
+  `ORIG_REF_NAME == ts_gray_sync`): `ASYNC_REG` on the two synchroniser stages, `set_max_delay
+  -datapath_only 4.0` and `set_bus_skew 3.0` from each instance's Gray register to its first
+  synchroniser stage (five instances, §6c).
+
+**Implementation (build of 2026-09-25 16:56, the validated bitstream).** All constraints met:
+WNS +0.050 ns (core 300 MHz), WHS +0.011 ns, pulse width and max skew clean, bus skew ≥ +2.0 ns.
+The MicroBlaze implementation settings in `build.tcl` (strategy
+`Performance_ExplorePostRoutePhysOpt`, post-route `phys_opt_design` directive
+`ExploreWithAggressiveHoldFix` for the MIG 333 MHz ↔ 100 MHz SmartConnect hold paths) were
+enough: no pblock and no lower core clock was needed. Utilisation of the XCKU5P: 91.0 k LUT
+(41.9 %), 113.4 k FF (26.1 %), 276 BRAM36 (57.5 %), 11 DSP, 1 CMACE4, 4 GTYE4, 2 MMCM. Known
+benign CRITICAL WARNINGs: `[Designutils 20-1280]` ×2 for the xdc of the unused `_ll_` GT wizard
+IPs (created by Taxi's script, not instantiated with `CFG_LOW_LATENCY 0`); the evaluation-license
+warning `[12-1790]` is the usual false positive.
+
+## 6c. `zircon_cmac_us` — UltraScale+ CMAC shim (kcu116)
+
+Opsero MIT module reference that turns Taxi's `taxi_eth_mac_100g_us` into the MAC-side interface
+`zircon_nic` expects on the vck190: 512-bit Taxi-convention AXI-Streams, the RX timestamp on
+`tuser[48:1]`, a TX timestamp request / return path with tags, and an AXI-Lite register block.
+
+- `Vivado/src/hdl/zircon_cmac_us.v`: flat-port Verilog shell with the `X_INTERFACE_*`
+  attributes (a module reference needs a `.v` top), the same style as `zircon_nic.v`.
+- `Vivado/src/hdl/zircon_cmac_us_core.sv`: the implementation. Instantiates
+  `taxi_eth_mac_100g_us`, `taxi_axil_apb_adapter`, `taxi_sync_reset`, `taxi_sync_signal`,
+  `zircon_cdc_snapshot` and the `taxi_axis_if` / `taxi_axil_if` / `taxi_apb_if` interfaces.
+- `Vivado/src/hdl/ts_gray_sync.sv` (MIT): Gray-code crossing of a free-running binary counter.
+
+Parameters (shell): `FAMILY` "kintexuplus", `CFG_LOW_LATENCY` 0 (Taxi's RK_XCKU5P_F example
+builds with 1; either works), `GT_TX_POLARITY` / `GT_RX_POLARITY` 4'b0000, `C_S_AXI_ADDR_WIDTH`
+19 (elaboration check), `TS_INCR` 1024 (a power of two), `SIM` 0. Core-only: `CTRL_HZ` 125000000
+(the clock-measurement window).
+
+```
+gt_ref_clk_clk_p/_n                    in   diff_clock gt_ref_clk (FREQ_HZ 322265625), IBUFDS_GTE4 inside
+gt_gtx_p/n[3:0], gt_grx_p/n[3:0]       out/in  gt interface "gt"
+ctrl_clk, ctrl_aresetn                 in   125 MHz; ASSOCIATED_BUSIF s_axi
+ts_clk, ts_aresetn                     in   250 MHz timestamp timebase
+tx_clk, rx_clk                         out  322.265625 MHz (Taxi tx_clk / rx_clk)
+mac_tx_aresetn, mac_rx_aresetn         out  active low, released synchronously (4-stage taxi_sync_reset) in tx_clk / rx_clk
+m_axis_mac_rx_{tdata[511:0], tkeep[63:0], tvalid, tlast, tuser[48:0]}, m_axis_mac_rx_tready (ignored)
+s_axis_mac_tx_{tdata[511:0], tkeep[63:0], tvalid, tready, tlast, tuser[0:0]}
+s_axis_tx_ptp_{tdata[23:0], tvalid, tready}     [1:0] op, [17:2] tag
+tx_ptp_tstamp_out[54:0], tx_ptp_tstamp_tag_out[15:0], tx_ptp_tstamp_valid_out   (tx_clk)
+link_up                                out  CMAC rx_status (rx_clk, unregistered; LED only)
+s_axi_*                                     AXI4-Lite, 32-bit data, 19-bit address (ctrl_clk)
+```
+
+**Taxi wrapper as used.** `taxi_eth_mac_100g_us` with 4 GTY lanes, `PTP_TS_EN` 0, `PTP_TD_EN` 0,
+`STAT_EN` 0 (its unused `m_axis_stat` and `m_axis_tx_cpl` are terminated in the shim),
+`xcvr_ctrl_clk` = `ctrl_clk`, `xcvr_ctrl_rst` = `CTRL.XCVR_RST` or `ctrl_aresetn` low, both QPLL
+refclk inputs from the one `IBUFDS_GTE4`, `rx_rst_in` / `tx_rst_in` = CTRL.RX_RST / TX_RST,
+`cfg_tx_enable` / `cfg_rx_enable` = CTRL.TX_EN / RX_EN (synchronised into `tx_clk` / `rx_clk`).
+What the wrapper does at `cc70b27`, and therefore this target:
+
+- **RS-FEC is hard-wired on** (`ctl_tx/rx_rsfec_enable`, correction and indication), with no
+  run-time change and no FEC counters (`stat_rx_rsfec_*` are left open).
+- **No PTP.** `tx_ptp_ts_out`, `rx_ptp_ts_out`, `*_ptp_locked` and `m_axis_tx_cpl` are declared but
+  never driven, the CMAC `tx/rx_ptp_tstamp_*` outputs are open and `ctl_*_systemtimerin` is tied
+  0. With `PTP_TS_EN` = 1 `m_axis_rx.tuser` would be 97 bits wide but driven by a 1-bit tuser.
+- `cfg_tx/rx_max_pkt_len` exist but are not connected to the CMAC: the maximum frame length is
+  the IP's static default (≥ 9046 verified on the bench with 9000-byte payloads, believed 9600; §1.1, §12.8.1).
+- `m_axis_rx` comes straight from the CMAC (no back-pressure; `tuser[0]` = error on the last
+  beat); `s_axis_tx` goes through `taxi_axis_pad` (`UNDERFLOW_DROP_EN`) into the CMAC.
+- A built-in watchdog resets the CMAC RX when `rx_status` has been low for 2²⁸ `rx_clk` cycles
+  (~0.83 s).
+- The IPs are created by Taxi's own scripts (§7.1): CMAC `taxi_eth_mac_100g_us_cmac` (CAUI-4,
+  AXIS, `INCLUDE_RS_FEC 1`, `ENABLE_TIME_STAMPING 1`, `GT_LOCATION 0`, IP LOC xdc disabled) and
+  the GT wizards `taxi_eth_mac_100g_us_gty_{full,ch,ll_full,ll_ch}` (`DISABLE_LOC_XDC 1`).
+
+**RX (rx_clk).** One register stage after the CMAC. `tuser[0]` = CMAC error (last beat);
+`tuser[48:1]` = ts55[54:7] sampled at the frame's first CMAC beat, on every beat (the
+`mrmac_rx_packer` contract, so `rx_dispatch`, ZRXT and `echo_rec_t` are unchanged). No
+back-pressure: `m_axis_mac_rx_tready` is ignored (zircon_nic's MAC-side FIFO never deasserts it).
+
+**TX (tx_clk).** `s_axis_mac_tx` goes straight into the wrapper. `s_axis_tx_ptp` records wait in
+a 16-entry LUTRAM FIFO with fall-through (a record may arrive in the same cycle as its frame's
+first beat); `tready` = not full. At the handshake of each frame's first beat (`tvalid & tready
+& sof`) the head record is popped; for op 2'b10 `{ts55, tag}` is returned on `tx_ptp_tstamp_*`
+one cycle later (pipelined, deterministic); op 0 returns nothing. No record at SOF: the frame goes
+out untagged and STICKY.PTP_UNDERRUN is set. The shim never gates `tvalid` on a record (the CMAC
+must not see a mid-frame underflow). A TX reset clears the record FIFO.
+
+**Timebase.** A 45-bit tick counter on `ts_clk` (reset by `ts_aresetn`); ts55 = `{tick, 10'b0}`
+(`TS_INCR` 1024 = 2⁻⁸ ns units, 4 ns per tick: the same format as the vck190's `ptp_systimer`,
+which is not instantiated on this target). Three `ts_gray_sync` instances (W = 45) carry the tick
+count into `tx_clk`, `rx_clk` and `ctrl_clk`: the source registers `gray = bin ^ (bin >> 1)`; the
+destination has two `ASYNC_REG` stages, then Gray → binary over three pipelined stages (top,
+middle, bottom thirds) and an output register. Latency: 1 source cycle + 5 destination cycles
+(+ up to one of sampling phase), identical in the `tx_clk` and `rx_clk` instances, so the fixed
+part cancels in TX − RX. Two more instances (W = 20) carry the `tx_clk` / `rx_clk` measurement
+counters into `ctrl_clk` (five in total, all covered by `zircon_cmac_us.tcl`).
+
+**Register map** (AXI4-Lite, 32-bit, `ctrl_clk`, byte offsets from the shim base, 0x4400_0000 on
+the kcu116). Bit 18 of the address selects the GT APB space; below it, offsets 0x000..0x0FF are
+decoded and the rest of 0x0_0000..0x3_FFFF reads 0 and ignores writes. CTRL and STICKY are
+written with byte lane 0.
+
+| offset | name | R/W | meaning |
+|---|---|---|---|
+| 0x000 | ID | R | `0x434D4143` ("CMAC") |
+| 0x004 | VERSION | R | `0x00010000` (1.0.0) |
+| 0x008 | CTRL | RW | b0 XCVR_RST (Taxi `xcvr_ctrl_rst`: GT + CMAC held in reset), b1 RX_RST, b2 TX_RST (levels to Taxi `rx_rst_in` / `tx_rst_in`), b4 TX_EN (`cfg_tx_enable`), b5 RX_EN (`cfg_rx_enable`). **Reset value 0x31** = XCVR_RST \| TX_EN \| RX_EN: the transceivers stay in reset until software releases them after programming the Si5328 |
+| 0x00C | STATUS | R | synchronised into `ctrl_clk`: b0 RX_STATUS (CMAC RX aligned, = `link_up`), b1 RX_BLOCK_LOCK, b2 RX_HIGH_BER, b3 TX_RST_OUT, b4 RX_RST_OUT (Taxi's reset outputs), b5 GTPOWERGOOD, b6 TX_CLK_ALIVE, b7 RX_CLK_ALIVE (TX_CLK_KHZ / RX_CLK_KHZ non-zero) |
+| 0x010 | STICKY | R/W1C | b0 LINK_LOST (RX_STATUS fell), b1 PTP_UNDERRUN (a TX frame started with no PTP record), b2 TS_RECORD_OVF (a PTP record was offered while the 16-entry record FIFO was full; zircon_nic then waits, so it means records without frames) |
+| 0x020 | TS_NOW_LO | R | ts55[31:0] as seen in `ctrl_clk`; **a read latches TS_NOW_HI** |
+| 0x024 | TS_NOW_HI | R | ts55[54:32] in bits 22:0, latched by the last TS_NOW_LO read |
+| 0x028 | TS_INCR | R | `TS_INCR` (1024: 2⁻⁸ ns units per 250 MHz `ts_clk` cycle) |
+| 0x030 | RX_GOOD_PKTS | R | CMAC `stat_rx_pkt_good` events |
+| 0x034 | RX_BAD_FCS | R | CMAC `stat_rx_err_bad_fcs` events |
+| 0x038 | RX_ERR_FRAMES | R | frames delivered with `tuser[0]` = 1 |
+| 0x03C | TX_GOOD_PKTS | R | CMAC `stat_tx_pkt_good` events |
+| 0x040 | TX_FRAMES | R | frame starts accepted at the shim |
+| 0x044 | TX_TS_RET | R | TX timestamps returned (op 2'b10 frames) |
+| 0x048 | TX_CLK_KHZ | R | `tx_clk` counted over a 1 ms window of `ctrl_clk` (322265 expected) |
+| 0x04C | RX_CLK_KHZ | R | the same for `rx_clk` |
+| 0x4_0000..0x7_FFFF | GT_APB | RW | Taxi's transceiver-control APB (§ below) |
+
+Counters 0x030..0x044 are 32 bits, count in their event domain (`rx_clk` / `tx_clk`), cross to
+`ctrl_clk` as coherent snapshots (`zircon_cdc_snapshot`) and are **never reset**: they only wrap,
+so software deltas stay valid across link and GT resets. The register block itself is reset by
+`ctrl_aresetn` (CTRL back to 0x31, STICKY 0).
+
+**GT APB window (0x4_0000..0x7_FFFF).** `taxi_axil_apb_adapter` converts each AXI-Lite access
+into 16-bit APB transfers on Taxi's `s_apb_ctrl` (18-bit APB address = AXI address [17:0]); the
+wrapper's `taxi_apb_interconnect_1s` gives lane *n* a 16-bit register space at
+0x4_0000 + *n* × 0x1_0000. Per-lane registers (byte offsets within the lane): 0x1000 TX reset /
+PMA / PCS (done bits 9..11), 0x1010 TX polarity / electrical idle / inhibit, 0x1012..0x1018 TX
+driver, 0x2000 RX resets (done bits 9..11), 0x2004 loopback, 0x2010 RX polarity, 0x2024 LPM;
+QPLL0 / QPLL1 in lane 0 only, at 0x0BB8 / 0x0C1C (Taxi's decimal `14'd3000` / `14'd3100`). The
+adapter splits a 32-bit access into two 16-bit transfers starting at segment `addr[1]` (a 16-bit
+access at +2 is one transfer, one at +0 two, the second with `pstrb` = 0). The Taxi GT registers
+ignore `pstrb`, so the shim's APB filter completes any write segment with `pstrb` = 0 itself
+without forwarding it: **a 16-bit write touches only its register**, a 32-bit write writes both
+halves, reads read what the adapter asks. While CTRL.XCVR_RST is set, and for 32 `ctrl_clk`
+cycles after it clears, the wrapper's APB interconnect is held in reset and would never answer,
+so the filter completes every GT_APB transfer with **SLVERR** (read data 0) instead of hanging
+the AXI bus. The application does not use the GT APB space.
+
 ## 7. Repository layout
 
 ```
-config/data.json, config/update.py      manifest (one target) and the README / docs table updater
+config/data.json, config/update.py      manifest (two targets) and the README / docs table updater
 build.py, build.sh, build.bat           cross-platform build runner (no Makefiles, no Linux flow)
 Vivado/scripts/{build.tcl, xsa.tcl, zircon_sources.tcl}
-Vivado/src/bd/bd_versal.tcl             block design (§6)
-Vivado/src/constraints/vck190_fmcp1.xdc
+Vivado/scripts/cmac_sources.tcl         kcu116: Taxi 100G CMAC sources (.f expander), shim, CDC scripts (§7.1)
+Vivado/scripts/cfgmem.tcl               kcu116: QSPI .mcs / .prm from zircon_boot.bit (§7.1)
+Vivado/src/bd/bd_versal.tcl             vck190 block design (§6)
+Vivado/src/bd/bd_microblaze.tcl         kcu116 block design (§6b)
+Vivado/src/constraints/                 vck190_fmcp1.xdc, kcu116.xdc, zircon_cmac_us.tcl (shim CDC)
 Vivado/src/hdl/                         zircon_nic.v (shell), zircon_nic_core.sv, zircon_nic_pkg.sv,
                                         zircon_regs.sv, zircon_cdc_snapshot.sv, hdr_trunc.sv,
                                         rx_meta_capture.sv, rx_dispatch.sv, tx_len_guard.sv,
                                         raw_tx_desc_strip.sv, tx_meta_builder.sv, tx_mac_out.sv,
                                         udp_gen.sv, udp_chk.sv, rate_meter.sv, ptp_tx_tagger.sv,
                                         latency_stats.sv, mrmac_rx_packer.v, mrmac_axis_adapter.v
-                                        (mrmac_tx_axis_adapter), ptp_systimer.v
+                                        (mrmac_tx_axis_adapter), ptp_systimer.v (vck190);
+                                        zircon_cmac_us.v, zircon_cmac_us_core.sv, ts_gray_sync.sv (kcu116)
 Vivado/src/hdl/tb/                      run_xsim.sh, gen_vectors.py, tb_zircon_nic.sv,
-                                        tb_mrmac_rx_packer.sv, tb_ptp_units.sv
-Vitis/py/{args.json, build-vitis.py, make-boot.py}
+                                        tb_mrmac_rx_packer.sv, tb_ptp_units.sv, tb_zircon_cmac_us.sv
+Vitis/py/{args.json, build-vitis.py, make-boot.py, pre_platform_build.py}
 Vitis/common/src/                       the echo_server application (§8)
-EmbeddedSw/                             lwipopts.h.in override (software checksums)
+EmbeddedSw/                             lwipopts.h.in override (software checksums), every target
+EmbeddedSw.microblaze/                  lwip220 overlay for MicroBlaze (lwip220.yaml, CMakeLists.txt)
 scripts/                                zircon_echo_test.py, zircon_prbs_tool.py, echo_test.py (host side)
 docs/                                   Sphinx user guide (docs/source), this spec
 submodules/taxi                         Taxi transport library incl. Zircon (CERN-OHL-S-2.0), pinned
@@ -566,16 +921,95 @@ submodules/taxi                         Taxi transport library incl. Zircon (CER
 
 Target `vck190_fmcp1`: board VCK190, connector FMCP1, family versal, `ports` 2, `fec` rs,
 `baremetal` true, `petalinux` false, `yocto` false, `license` true (the no-cost MRMAC license;
-Vivado Enterprise for the XCVC1902).
+Vivado Enterprise for the XCVC1902). Boot file `Vitis/boot/vck190_fmcp1/BOOT.BIN`.
+
+Target `kcu116`: board KCU116, connector HPC, group `fpga` (build family microblaze), `ports` 1,
+`fec` rs, `baremetal` true, `petalinux` false, `yocto` false, `license` false (the XCKU5P is in
+the free Vivado Standard edition), `ip_license` true (the no-charge CMAC license), `cfgmem` true
+with `flashsize` 128 (MB) and `flashintf` SPIx4. Boot files `Vitis/boot/kcu116/zircon_boot.bit`
+(bitstream with the application in the LMB BRAM) and `zircon_boot.mcs` / `.prm` (QSPI image).
+The bootimage zip carries all three.
+
+### 7.1 Build flow of the kcu116 (MicroBlaze) target
+
+`./build.sh all --target kcu116` runs `xsa → standalone → cfgmem → package`. The data.json group
+`fpga` maps to the build family `microblaze` in `build.py`; `config/update.py` writes
+`dict set target_dict kcu116 { xilinx.com kcu116 microblaze { 0 } rs }` into the UPDATER block of
+`build.tcl`, which then sources `src/bd/bd_microblaze.tcl` and `src/constraints/kcu116.xdc`.
+
+- **Vivado IP from Taxi's own scripts.** Before the block design is sourced, `build.tcl` (only
+  when `bd_script` is `microblaze`) sources Taxi's unmodified
+  `src/eth/rtl/us/taxi_eth_mac_100g_us_cmace4.tcl` and `taxi_eth_mac_100g_us_gty_322.tcl`, which
+  `create_ip` the CMAC and the four GT wizards in the open project, then
+  `scripts/cmac_sources.tcl`. There is no `ip` stage for this target.
+- **`.f` expander** (`cmac_sources.tcl`, proc `taxi_read_f`). Taxi's file lists
+  (`taxi_eth_mac_100g_us.f` → `_gt.f`, `_gt_ll.f`, `../taxi_eth_mac_phy_10g.f`,
+  `../taxi_eth_mac_stats.f`, …) reference the rest of the library through the symlink
+  `src/eth/lib/taxi -> ../../../`, which does not survive every checkout (Windows, zip downloads).
+  The expander never follows it: an entry is resolved relative to its `.f`, and any path that
+  contains `/lib/taxi/` is rewritten to the submodule root plus the rest (`../../lib/taxi/src/…`
+  → `submodules/taxi/src/…`). It recurses into `.f` entries, skips a list already being expanded
+  (`taxi_eth_mac_stats.f` names itself), drops duplicates, and adds every file through
+  `add_src_once` (so nothing is added twice with `zircon_sources.tcl`). It then adds
+  `taxi_axil_if.sv`, `taxi_axil_apb_adapter.sv`, `taxi_apb_if.sv` and the shim
+  (`zircon_cmac_us.v` as Verilog, the rest as SystemVerilog). `build.tcl`'s generic
+  `src/hdl/*` glob skips the three shim files, so the vck190 project's file list is unchanged.
+- **Constraint processing order LATE.** `cmac_sources.tcl` adds the implementation-only Taxi
+  CDC scripts (`taxi_axis_async_fifo.tcl`, `taxi_sync_reset.tcl`, `taxi_sync_signal.tcl`) and
+  `zircon_cmac_us.tcl`, and on this target sets `PROCESSING_ORDER LATE` on them and on
+  `zircon_sources.tcl`'s scripts. The scripts look up each crossing's clocks with `get_clocks
+  -of_objects`; here the CMAC `tx_clk` / `rx_clk` derive from `gt_ref_clk_0`, which
+  `kcu116.xdc` creates. With the default order they ran first, found no GT-derived clock, and
+  `taxi_axis_async_fifo.tcl` skipped the write-clock → LUTRAM output-register false path; the
+  router then detoured those paths for hold (core clock WNS −13.1 ns, `ctrl_clk` −8.9 ns in the
+  first build). The vck190 flow is unaffected (its clocks all come from IP xdc).
+- **Implementation settings** (`build.tcl`, MicroBlaze branch): `write_bitstream` instead of
+  Versal's `write_device_image`; strategy `Performance_ExplorePostRoutePhysOpt`; post-route
+  `phys_opt_design` directive `ExploreWithAggressiveHoldFix`.
+- **Vitis** (`Vitis/py/args.json`): `linker_script_mods {"microblaze": "code_local_bss_ddr"}`,
+  `compile_optimization {"microblaze": "-O2"}`, `gc_sections {"microblaze": true}`,
+  `stack_size` 0x8000 / `heap_size` 0x10000 on MicroBlaze, `pre_platform_build_script`
+  `py/pre_platform_build.py` (xiltimer `XILTIMER_sleep_timer` = `axi_timer_0` on MicroBlaze, no
+  tick timer; nothing on Versal), `combine_bit_elf` true (read only for MicroBlaze).
+  `build-vitis.py` layers `EmbeddedSw.microblaze/` over `EmbeddedSw/` on MicroBlaze (lwip220
+  refuses to build without an AMD MAC otherwise), applies the linker modification after the stack
+  and heap sizes, and prints the LMB use of the ELF. The Versal app keeps `-O0`, no gc, and an
+  unchanged `lscript.ld`.
+- **Boot file.** `make-boot.py` embeds the ELF in the bitstream with `updatemem` (`-proc
+  zircon_i/microblaze_0`) → `Vitis/boot/kcu116/zircon_boot.bit`.
+- **QSPI image** (`build.py` stage `cfgmem`, `Vivado/scripts/cfgmem.tcl <target> <bit> <out_mcs>
+  [flashsize] [flashintf]`): on a MicroBlaze bare-metal target the source is `zircon_boot.bit`
+  (so the `.mcs` boots the application too) and `zircon_boot.mcs` / `.prm` are written next to
+  it; `write_cfgmem -format mcs -size 128 -interface SPIx4 -loadbit "up 0x0 …" -checksum`. The
+  compressed image spans 0x0000_0000..0x00BC_8DEB of the 128 MB flash.
+- **Flash part.** The KCU116 configuration flash identifies as a Micron **MT25QU01G** (1 Gb =
+  128 MB, JEDEC 20 BB 21); Vivado's `program_hw_cfgmem` part is `mt25qu01g-spi-x1_x2_x4`
+  (`mt25qu256` is rejected). The board catalog's "2 × 32 MB QSPI" does not match the fitted
+  part. Mode pins M[2:0] = 001 (master SPI) as delivered.
+
+### 7.2 Licensing and tool editions
+
+| target | Vivado edition | IP license |
+|---|---|---|
+| `vck190_fmcp1` | Enterprise (the XCVC1902 is not in Standard) | Versal MRMAC, no charge; needed for the device image |
+| `kcu116` | Standard (free) suffices for the XCKU5P | UltraScale+ 100G CMAC (`cmac_usplus` with RS-FEC), AMD's no-charge license key |
+
+On the build host the kcu116 bitstream generation shows only the usual `[12-1790]`
+evaluation-license warning, a known false positive. Zircon, Taxi (including the CMAC wrapper)
+and the Opsero glue need no license key; the Taxi sources are CERN-OHL-S-2.0.
 
 ## 8. Software behaviour (bare-metal `echo_server`)
 
 One polled main loop, no interrupts; lwIP 2.2.0 (`lwip220`, NO_SYS, raw API) with its timers
-paced from the Arm generic timer; console output through a RAM ring drained without blocking.
-`NUM_PORTS` follows the XSA (2 when it has `axi_dma_raw_1`; `-DNUM_PORTS=1` builds port 0 only).
-All settings are in `app_config.h` and can be overridden with `-D`.
+paced from a free-running 64-bit timebase (`timebase.h`: the Arm generic timer through
+`XTime_GetTime()` on the vck190, `axi_timer_1` on the kcu116, §8.2); console output through a
+RAM ring drained without blocking. `NUM_PORTS` follows the XSA (2 when it has `axi_dma_raw_1`;
+`-DNUM_PORTS=1` builds port 0 only; always 1 on the kcu116). All settings are in `app_config.h`
+and can be overridden with `-D`. The same sources build for both targets; the differences are
+behind `HW_MAC_CMAC` (§8.1) and `__MICROBLAZE__` (§8.2).
 
-**Bring-up** (`main.c`, each step depends on the previous): VADJ = 1.5 V (VCK190 regulator over
+**Bring-up** (`main.c`, each step depends on the previous; vck190 — the kcu116 sequence is in
+§8.2): VADJ = 1.5 V (VCK190 regulator over
 the PS I2C) → Si5328 free-run 322.265625 MHz on CKOUT1 and CKOUT2 → per port: `zircon_nic` ID
 check, MAC, `ECHO_PORT` 7, `SOCK_LOCAL_PORT` 5000, TTL 64, `CHK_PORT` 5001 (datapath still
 disabled; a port whose `zircon_nic` does not answer is skipped); GT reset; MRMAC configuration
@@ -606,8 +1040,9 @@ behind a ZTXT descriptor with TS_REQ. The request is disarmed after `netif->inpu
 defers `tcp_output()` of the pcb being processed until the receive callback has returned).
 Bank 1 therefore counts exactly one sample per TCP exchange of up to one segment.
 
-**Console** (UART0, 115200 8N1): `h`/`?` help, `s` status, `z` register dump, `c` clear counters
-(`STAT_CLR`), `f` cycle the FEC mode of both ports (RS(528,514) → off → RS(544,514)), `l`
+**Console** (vck190: PS UART0; kcu116: `axi_uartlite_0`; 115200 8N1): `h`/`?` help, `s` status,
+`z` register dump, `c` clear counters (`STAT_CLR`), `f` cycle the FEC mode of both ports
+(RS(528,514) → off → RS(544,514); on the kcu116 it only prints `FEC fixed on this target`), `l`
 cross-port loopback test, `e` echo-through-loopback test, `L <port>` self-loopback test (QSFP28
 loopback plug), `p <bytes>` test payload (8..9000, default 1472), `i [<port> <mode>]` address
 mode, `T [<port>] [c]` latency report / clear. A status line per port (`P0`, `P1`) is printed on
@@ -638,13 +1073,80 @@ uptime) + two 552-byte banks (count, sum, sumsq, min, max, implausible, last, 64
 
 **UART strings the bench keys on:** `Port <n>: link up, 100 Gb/s, FEC RS(528,514)`,
 `Port <n>: IP <a.b.c.d> … (DHCP|static)`, `LOOPBACK: PASS` / `LOOPBACK: FAIL …`,
-`LOOPBACK-ECHO: PASS`, `zircon_nic <x.y.z> at <addr> (port <n>)`.
+`LOOPBACK-ECHO: PASS`, `zircon_nic <x.y.z> at <addr> (port <n>)`. They are identical on both
+targets.
+
+### 8.1 MAC abstraction (`mac.h`)
+
+`port.c`, `main.c`, `latency.c` and `loopback.c` reach the MAC only through `mac.h`. Every call
+takes the port's `const hw_port_t *` (`hw_config.h`; its MAC base is `.mac`, and `.gpio_gt`
+exists only on Versal), so a backend uses whichever resources it needs:
+
+| call | vck190: `mrmac.c` | kcu116: `cmac_taxi.c` |
+|---|---|---|
+| `mac_hw_reset` | GT reset through the port's GT-control GPIO | shim ID check; CTRL = XCVR_RST \| TX_EN \| RX_EN, 10 ms (`CMAC_XCVR_RST_HOLD_MS`), clear XCVR_RST, wait up to 100 ms for STATUS.TX_RST_OUT = 0 (else print STATUS, GTPOWERGOOD, TX_CLK_KHZ / RX_CLK_KHZ), clear STICKY |
+| `mac_port_init(fec)` | MRMAC 100G configuration with the FEC (§6); also the link retry | TX_EN \| RX_EN and a 1 ms CTRL.RX_RST pulse, statistics baseline; the FEC argument is ignored; also the link retry |
+| `mac_link_up` | MRMAC `stat_rx_status` | STATUS.RX_STATUS |
+| `mac_get_fec` / `mac_fec_name` | the programmed mode | always RS(528,514) |
+| `mac_tick(stats)` | MRMAC statistics | 32-bit shim counter deltas into `u64` totals: rx packets = RX_GOOD_PKTS + RX_ERR_FRAMES, tx packets = TX_FRAMES; FEC codeword totals stay 0 (printed `n/a`) |
+| `mac_ptp_underrun` | GT-control GPIO CH2 b2 | STICKY.PTP_UNDERRUN |
+| `mac_supports_fec_change` | 1 | 0 (`f` prints `FEC fixed on this target`, `APP_FEC_MODE` other than RS(528,514) prints a NOTE) |
+| `mac_ts_now` / `mac_ts_incr` | — (the 1588 check reads the MRMAC monitor registers) | TS_NOW (LO then HI), TS_INCR |
+
+On Versal the `mac_*` calls are inline wrappers around the unchanged `mrmac_*` API; `mrmac.c` is
+compiled only without `HW_MAC_CMAC`, and `cmac_taxi.c` only with it. `hw_config.h` defines
+`HW_MAC_CMAC` for `__MICROBLAZE__` (overridable). The link retry is the same on both: while a link
+is down `port.c` calls `mac_port_init()` every `LINK_RETRY_MS` (2 s); on the kcu116 the Taxi
+wrapper's watchdog also resets the CMAC RX by itself after ~0.83 s without `rx_status`. The
+latency bring-up check on the kcu116 reads the shim's TS_NOW twice 10 ms apart and prints the
+advance against CPU time (`shim timestamp timer … advanced … ns in … ns of CPU time`).
+
+### 8.2 MicroBlaze specifics (kcu116)
+
+- **Bring-up order** (`main.c`): I- and D-cache enable (the 2025.2 MicroBlaze start-up code
+  leaves them off) → `timebase_init()` → no VADJ step (fixed 1.8 V) → Si5328 322.265625 MHz on
+  CKOUT1 → per port: zircon_nic set-up, **then** `mac_hw_reset()` releases CTRL.XCVR_RST (the
+  Taxi GT reset sequencer needs the reference clock, so the release must follow the Si5328) →
+  `mac_port_init()` → the rest as on the vck190.
+- **`hw_config.h`**: `HW_NUM_PORTS` 1; `ZIRCON_NIC_0_FALLBACK_BASEADDR` 0x440A0000 and
+  `CMAC_0_FALLBACK_BASEADDR` 0x44000000 (module references, no `XPAR_`); DMAs, IIC, GPIO from
+  `XPAR_*`; `TIMEBASE_BASEADDR` from `axi_timer_1`.
+- **Timebase** (`timebase.[ch]`): `axi_timer_1` with both 32-bit counters cascaded into one 64-bit
+  up-counter, read hi / lo / hi, `TB_HZ` = the timer clock (100 MHz). xiltimer's `XTime` on an
+  AXI timer is only 32 bits (43 s at 100 MHz), and `axi_timer_0` belongs to xiltimer's
+  `usleep()` / `sleep()`. `timebase_ms()` keeps a running millisecond count (one 32-bit divide
+  per call instead of a 64-bit libgcc divide on every main-loop pass).
+- **Console** (`console.c`): the UART Lite backend (`xuartlite_l.h`, non-blocking drain, polled
+  RX); the baud rate is fixed in the IP.
+- **DMA** (`zdma.c`): no MMU to remap the BD rings non-cacheable, so they stay cached and the AXI
+  DMA driver's BD flush / invalidate macros (compiled in on non-A53 targets) keep them coherent;
+  buffers keep their explicit flush / invalidate calls; 32-bit addresses; `mbar 1` as the data
+  barrier.
+- **64-bit arithmetic** is soft (libgcc); newlib's `%llu` works (`_svfprintf_r` uses
+  `__udivdi3` / `__umoddi3`); `double` in `latency.c` is soft float.
+- **Memory layout** (`build-vitis.py` linker modification `code_local_bss_ddr`): `.text`,
+  `.init`, `.fini`, `.rodata*`, `.sdata2`, `.sbss2`, `.data*`, `.sdata`, `.sbss`, constructors,
+  `.eh_frame`, `.init_array` / `.fini_array`, `.drvcfg_sec` and the 32 KB stack in the 256 KB LMB
+  (`.sdata` and `.sbss` stay together: the r13 small-data window); `.bss` (lwIP pbuf pools, DMA
+  rings and buffers) and the heap in DDR4, zeroed by the start-up code. Only the LMB is embedded
+  in the bitstream by `updatemem`, which is why nothing initialised may live in DDR. The
+  application at `-O2` with `--gc-sections` uses 218,752 of 262,144 LMB bytes (83 %); `.bss` +
+  heap in DDR are ~6.9 MB.
+- **Boot**: `zircon_boot.bit` (JTAG) or `zircon_boot.mcs` from QSPI (§7.1); there is no FSBL and
+  no SD card. The application starts from the LMB as soon as the FPGA is configured; on the
+  bench it ran cleanly from QSPI with no reset after DDR4 calibration.
+- **Speed**: the 100 MHz MicroBlaze makes the software paths (lwIP, the TCP echo, the socket
+  demo) roughly 14× (64 B) to 50× (1460 B) slower than on the A72 (§12.8); the hardware paths
+  are unaffected.
 
 ## 9. Bench / validation contract
 
-Every hardware change is validated on the VCK190 with the build's `BOOT.BIN` (SD card) or its PDI
-+ ELF over JTAG, and the result is reported with the build commit and date. Fixtures and pass
-criteria:
+Every hardware change is validated on the target it affects: on the VCK190 with the build's
+`BOOT.BIN` (SD card) or its PDI + ELF over JTAG; on the KCU116 with `zircon_boot.bit` (or
+`zircon_wrapper.bit` + `echo_server.elf`) over JTAG, and for a release also from QSPI
+(`zircon_boot.mcs`, then a power cycle with JTAG idle). A change to `zircon_nic` is validated on
+both. The result is reported with the build commit and date. Fixtures and pass criteria (the
+cross-port rows need two ports and apply to the VCK190 only):
 
 | fixture | test | pass |
 |---|---|---|
@@ -655,9 +1157,12 @@ criteria:
 | QSFP28 loopback plug in port p | `L <p>` | `LOOPBACK: PASS` |
 | port 0 or 1 cabled to a 100G NIC in RS-FEC "auto" (bench: Intel E810-C, DHCP from the host) | `scripts/zircon_echo_test.py <ip> --port <p> [--ping] [--jumbo] [--latency]` | `VERDICT: PASS` (hardware UDP echo incl. a 20000-datagram burst, software TCP echo, socket bounce; with `--latency` both banks counted the exchanges) |
 | same | `scripts/zircon_prbs_tool.py listen / send` | generator → host and host → checker, zero errors |
+| KCU116, QSFP port 0 cabled to the same host | JTAG load, then the host rows above | UART `Port 0: link up, 100 Gb/s, FEC RS(528,514)` and `Port 0: IP …`, then `VERDICT: PASS` (the software TCP echo is slower; `--timeout` exists if needed) |
+| same | QSPI programmed with `zircon_boot.mcs` (`mt25qu01g-spi-x1_x2_x4`), power cycle, no JTAG | `Port 0: link up …` and `Port 0: IP …` on the UART, `VERDICT: PASS` |
 
 A cross-port run also shows that both ports' MRMACs, GT quads and reference clocks work. After
-a DMA wedge the board is power-cycled, never soft-reset.
+a DMA wedge the board is power-cycled, never soft-reset (a MicroBlaze target has no JTAG system
+reset: power-cycle, then re-program).
 
 ## 10. Hardware UDP generator / checker and rate meters
 
@@ -753,7 +1258,9 @@ Below that the packet rate is the limit: TX 300 / 18 = 16.7 Mpps, RX 300 / 16 = 
 512 B: TX ≈ 77 Gb/s line rate). Beyond the RX limit (traffic from another source) the MAC-side
 FIFO drops whole frames (RX_FIFO_DROP, seen by the checker as CHK_SEQ_ERR). Jumbo (9000 B) is far
 from both limits. The UI0 / UI2 DMAs move 512 bits per 100 MHz cycle, 51.2 Gb/s per direction.
-Bench measurements: §12.
+The kcu116 runs the same core at the same 300 MHz, so these limits apply to it unchanged; its MAC
+side (512 b at 322.27 MHz, 165 Gb/s of bus capacity) is not a limit either. Bench measurements:
+§12.
 
 ## 11. Latency measurement
 
@@ -762,6 +1269,8 @@ through the PS (bank 1, the lwIP TCP echo in `echo_server`) with the MRMAC's IEE
 timestamps: **delta = TX timestamp − RX timestamp**. The MRMAC takes both at the first PCS block
 of the frame (PG314 "Timestamping"), so the window is RX-PCS SOP of the request → TX-PCS SOP of
 the reply: serdes, PCS and RS-FEC latency excluded, every store-and-forward stage included.
+§11.1–11.6 describe the vck190; on the kcu116 the same `zircon_nic` logic, formats and registers
+work on fabric timestamps from the CMAC shim (§11.7).
 
 ### 11.1 Time base and formats
 
@@ -907,15 +1416,45 @@ difference (± 5 ns).
 | 24 (unit) | systimer: +1024 per cycle, periodic st_sync, sync_req pulse, once mode |
 | 13 / 14 / 20 (unit) | packer: RX timestamp on every output beat of every frame (random per frame, garbage elsewhere) |
 
+### 11.7 kcu116: fabric timestamps
+
+Taxi's CMAC wrapper provides no timestamps at `cc70b27`, so `zircon_cmac_us` takes them in logic
+(§6c) and `zircon_nic` is unchanged: same 55-bit, 2⁻⁸ ns format, same `tuser[48:1]` RX contract,
+same `m_axis_tx_ptp` / `tx_ptp_tstamp_*` TX contract, same banks, registers, descriptors and
+software.
+
+- **Time base**: a 45-bit tick counter on the 250 MHz `ts_clk`, ts55 = `{tick, 10'b0}` (+1024 per
+  4 ns); software reads it as the shim's TS_NOW. It does not count anything but time: there is no
+  `st_sync` and no `sync_req`.
+- **What is measured**: the RX timestamp is taken at the first beat of each frame at the CMAC
+  **client** RX interface, the TX timestamp at the first beat accepted at the shim / Taxi
+  boundary (the wrapper's `s_axis_tx`, in front of `taxi_axis_pad` and the CMAC). The window is
+  therefore **MAC-client SOF (RX) → MAC-client SOF (TX)**: the constant CMAC TX + RX pipeline (estimated
+  100–300 ns) is excluded, besides the serdes / PCS / RS-FEC stages the MRMAC figure already
+  excludes. **Absolute kcu116 numbers are not comparable with the vck190's PCS → PCS numbers.**
+- **Resolution**: 4 ns quantisation, plus up to one `ts_clk` and one destination-clock cycle of
+  sampling phase in each `ts_gray_sync` crossing: roughly ±4–7 ns per sample (estimate), the
+  mean unbiased (the fixed crossing latency is identical in `tx_clk` and `rx_clk` and cancels).
+  **Measured**: standard deviation 2.3 ns (64 B) to 2.8 ns (1472 B) for the hardware echo from a
+  host, against 1.0–2.4 ns with the vck190's MRMAC timestamps (§12.5, §12.8).
+- **Underrun**: `mac_ptp_underrun()` reads STICKY.PTP_UNDERRUN instead of the GT-control GPIO.
+- Rejected alternatives: Taxi's `taxi_ptp_td_phc` + leaf clock (more logic, a lock phase, 96/64-bit
+  formats), the CMAC's hard timestamps (they need changes to Taxi, whose sources stay unmodified),
+  and dropping the feature on this target.
+- xsim: `tb_zircon_cmac_us.sv` tests 104–108 and 111 (§3.4).
+
 ## 12. Performance measurements
 
 Bench results on the VCK190 + 2x QSFP28 FMC (OP120) on FMCP1, 100GBASE-R CAUI-4, RS-FEC
 RS(528,514). "Loopback" = an optical QSFP28 patch cable (100GBASE-SR4 modules) between port 0
 and port 1, no host; "host" = port 0 cabled to an Intel E810-C. Times are bench-journal times.
-The user-facing account with UART excerpts is `docs/source/testing.md`.
+The user-facing account with UART excerpts is `docs/source/testing.md`. §12.1–12.7 are the
+VCK190; the KCU116 results are in §12.8.
 
 | build label | commit / load | date |
 |---|---|---|
+| kcu116 1.3.0 | kcu116 target 6e24f6d (bitstream built 16:56, `zircon_boot.bit` 17:00); JTAG, then QSPI | 2026-09-25 17:02–17:22 (journal `logs/_bench/kcu116_journal.log`) |
+| kcu116 1.3.0, loopback plug | same `zircon_boot.mcs`, booted from QSPI (repo 7bb5d25) | 2026-09-25 19:40–19:54 (same journal) |
 | 1.3.0 final SD | hardware d8eda55, application c1ae2c1; `BOOT.BIN` booted from the SD card | 2026-09-25 08:13–08:31 |
 | 1.3.0 Phase B | hardware d8eda55 (+ application c1ae2c1 for the host run), JTAG | 2026-09-25 02:36 (loopback), 07:15 (host) |
 | 1.3.0 Phase A | first 1.3.0 build f684f59, JTAG | 2026-09-24 22:01 |
@@ -1068,6 +1607,104 @@ Host round-trip times in the same run (1.3.0 Phase B, 2026-09-25 07:15; one Pyth
 (JTAG, 2026-09-25 07:35:59): `L 1` 1472 B PASS, 100.00 Gb/s, 91,259,616 datagrams in 11 s,
 0 errors, LAT_STATUS 0.
 
+### 12.8 KCU116 (`kcu116`, port 0, zircon_nic 1.3.0, 2026-09-25 17:02–17:22 host, 19:40–19:54 loopback plug)
+
+Fixture (host): OP120 on the KCU116 HPC slot, QSFP port 0 cabled to the host's Intel E810-C
+(`ens6f1np1`, FEC auto → RS, MTU 1500, DHCP from the host); jumbo not tested against the host
+(MTU 1500). The loopback-plug results (§12.8.1) followed the same day.
+
+| check | result |
+|---|---|
+| JTAG load (`bench.py program kcu116 --arch microblaze --bit zircon_wrapper.bit --elf echo_server.elf`) | first load, no software change: `zircon_nic 1.3.0 at 0x440a0000 (port 0)`, `tx_clk` 322,270 kHz (322,265.625 expected), shim timer advanced 10,003,240 ns in 10,003,240 ns of CPU time, `Port 0: link up, 100 Gb/s, FEC RS(528,514)`, DHCP lease; host 100000 Mb/s, FEC RS; link up for the whole session. (The `configured` line's clock readings overlap the XCVR_RST release and are partial.) |
+| `zircon_echo_test.py --ping` | `VERDICT: PASS`: ping 3/3 (RTT 0.130 ms), HW UDP echo sweep 1..1472 B intact, burst 20,000 × 1472 B at 102,716 datagrams/s with 64 in flight (host-limited), SW TCP echo 100/100 (18.8 Mb/s), socket 55/55, host checksum errors +0 |
+| HW echo soak (17:06:01–17:07:24, after `c` and `T 0 c`) | 12,000,000 × 1472 B, 64 in flight, 143,759 datagrams/s (1.69 Gb/s payload each way, host-limited): `VERDICT: PASS`, 0 lost, 0 corrupt. zircon_nic RX = TX = 12,000,003, echo 12,000,001, every drop / checksum counter and STATUS 0. CMAC RX 12,000,003 good, 0 bad FCS, 0 error frames; TX 12,000,003 good, 12,000,001 TX timestamps returned. Bank 0: 12,000,001 samples, min 712 / mean 718.1 / max 740 ns, stddev 2.8 ns, all in the 704–768 ns bin; LAT_STATUS 0, stale / lost / ovf 0 |
+| checker from the host (`zircon_prbs_tool.py send --count 10000 --len 1000`, registers written with xsdb) | CHK_RX_PKTS 10,000, 0 sequence / bit / length errors |
+| generator to the host (1000 × 1000 B, GEN_GAP 3000, `zircon_prbs_tool.py listen`) | 1000/1000, sequence 0..999 contiguous, 0 bit errors, `VERDICT: PASS` |
+| QSPI boot (`program_hw_cfgmem` `mt25qu01g-spi-x1_x2_x4`, erase + program + verify 17:11–17:16; power cycle 17:16:30, no JTAG) | configured from flash, `Port 0: link up …`, `Port 0: IP … (DHCP)` at 17:16:38 (~8 s after power-on, 3 s of application time); `zircon_echo_test.py` `VERDICT: PASS` again |
+
+Latency (shim fabric timestamps, MAC-client SOF → SOF, §11.7; **not comparable with §12.5**),
+1000 exchanges per size, one in flight, board figures from `T 0`:
+
+| payload | board HW UDP echo min / mean / max, stddev | board SW TCP echo min / mean / max, stddev | host RTT UDP mean / p50 / p99 | host RTT TCP mean / p50 / p99 |
+|---|---|---|---|---|
+| 64 B | 380 / 385.2 / 392 ns, 2.3 ns | 86.3 / 93.1 / 117.2 µs, 3.8 µs | 29.2 / 28.7 / 38.8 µs | 131.6 / 126.8 / 164.3 µs |
+| 1472 B (TCP 1460 B) | 712 / 717.8 / 732 ns, 2.8 ns | 484.6 / 501.4 / 555.4 µs, 13.6 µs | 30.3 / 29.5 / 39.6 µs | 650.5 / 654.5 / 743.1 µs |
+
+Bank 1 counted exactly one sample per TCP exchange. The software TCP echo on the 100 MHz
+MicroBlaze takes 93.1 µs (64 B) and 501.4 µs (1460 B), against 6.79 µs and 9.70 µs on the A72.
+
+#### 12.8.1 KCU116 on a QSFP28 loopback plug (2026-09-25 19:40–19:54)
+
+Fixture: passive QSFP28 loopback plug in port 0 (host cable removed); v1.3.0 `zircon_boot.mcs`
+booted from QSPI after `bench.py power kcu116 cycle` (plug on 19:40:24). Link: `Port 0: link up,
+100 Gb/s, FEC RS(528,514)` on the first power-on, no retry, no intermediate link-down line; static
+fallback 192.168.20.2 (no DHCP); up for the whole session.
+
+Throughput vs payload, self-loop `L 0` (19:41:36–19:43:29), 16 s per size, pps = mean
+generator-TX delta over 9 × 1 s (tables 6–15 s), spread ≤ ±122 pps; totals from the stop
+summary. 128 B and 1500 B not run.
+
+| UDP payload | frame incl. FCS | line rate TX = RX | payload rate | pps | errors seq/bit/len | gen TX = chk RX at stop | verdict |
+|---|---|---|---|---|---|---|---|
+| 64 B | 110 B | 17.33 Gb/s | 8.53 Gb/s | 16,666,658 | 0/0/0 | 268,892,613 | FAIL rate (expected, TX header path 16.67 Mpps) |
+| 256 B | 302 B | 42.93 Gb/s | 34.13 Gb/s | 16,666,661 | 0/0/0 | 268,848,842 | FAIL rate (expected) |
+| 512 B | 558 B | 77.06 Gb/s | 68.26 Gb/s | 16,666,661 | 0/0/0 | 268,838,799 | FAIL rate (expected) |
+| 726 B | 772 B | 100.00 Gb/s | 91.66 Gb/s | 15,783,067 | 0/0/0 | 254,589,833 | PASS |
+| 1024 B | 1070 B | 100.00 Gb/s | 93.94 Gb/s | 11,468,070 | 0/0/0 | 184,974,080 | PASS |
+| 1472 B | 1518 B | 100.00 Gb/s | 95.71 Gb/s | 8,127,557 | 0/0/0 | 131,116,293 | PASS |
+| 9000 B | 9046 B | 100.00 Gb/s | 99.27 Gb/s | 1,378,799 | 0/0/0 | 22,237,117 | PASS |
+
+Same line / payload rates as §12.1 (95.71 vs 95.70 is rounding). pps at ≥ 726 B are ~+15 ppm
+above the theoretical 100GBASE-R rate (1472 B: 8,127,557 vs 8,127,438) while 64–512 B are within
+0.5 ppm of 300 MHz / 18: the table's time base follows the core clock, the line rate the Si5328
+GT refclk, so the 15 ppm is the offset between the two oscillators. After the sweep zircon_nic
+RX_FRAMES = TX_FRAMES = 1,399,497,581, drops and STATUS 0.
+
+Echo-through `e` (19:43:56–19:46:37, 31 s each, `T c` before / `T 0` after). One port: gen 0 →
+plug → port 0 HW echo (UDP 7) → plug → chk 0. Requests and replies share port 0's TX (round robin
+per packet), so each gets half the line; the rate meters count both.
+
+| payload | line / payload Gb/s (all frames) | datagrams/s checked | gen TX / chk RX | errors seq/bit/len | RX_ECHO_DROP | verdict |
+|---|---|---|---|---|---|---|
+| 64 B | 17.33 / 8.53 | 8,331,416 (gen 8,335,247) | 259,751,123 / 259,631,513 | 119,425/0/0 | 119,610 | FAIL rate (expected); drops = gen − chk exactly (TX header path oversubscribed by requests + replies) |
+| 726 B | 100.00 / 91.66 | 7,891,545 | 246,057,344 / 246,057,344 | 0/0/0 | 0 | PASS |
+| 1472 B | 100.00 / 95.71 | 4,063,787 | 126,683,970 / 126,683,970 | 0/0/0 | 0 | PASS |
+| 9000 B | 100.00 / 99.27 | 689,400 | 21,483,850 / 21,483,850 | 0/0/0 | 0 | PASS |
+
+Latency, bank 0 (shim, MAC-client SOF RX → TX, ns, §11.7; `LAT_STATUS` 0, stale / lost / ovf 0,
+0 implausible after every run). Under `e` load the reply queues behind the generator, so these
+measure the TX queue, not the path:
+
+| payload | traffic | samples | min | mean | max | stddev |
+|---|---|---|---|---|---|---|
+| 64 B | `e`, 31 s | 259,631,513 | 6468 | 31,252.0 | 43,964 | 23.8 |
+| 726 B | `e`, 31 s | 246,057,344 | 940 | 5909.0 | 5936 | 4.7 |
+| 1472 B | `e`, 31 s | 126,683,970 | 1236 | 7510.8 | 7540 | 5.9 |
+| 9000 B | `e`, 31 s | 21,483,850 | 4580 | 8943.5 | 8972 | 6.6 |
+| 64 B | 1000 paced, 1 ms apart | 1000 | 384 | 384.8 | 388 | 1.6 |
+| 726 B | 1000 paced | 1000 | 540 | 545.7 | 552 | 2.8 |
+| 1472 B | 1000 paced | 1000 | 716 | 720.1 | 736 | 2.5 |
+| 9000 B | 1000 paced | 1000 | 2876 | 2881.5 | 2896 | 2.4 |
+
+Paced rows (19:47:35–19:48:24): generator set over xsdb (MicroBlaze stopped briefly), GEN_DST =
+own MAC / 192.168.20.2:7, GEN_SRC_PORT 5001, GEN_COUNT 1000, GEN_GAP 300,000; each 1000/1000
+checked, 0 errors. They match the host figures above (385.2 / 717.8 ns) to within 2.3 ns;
+1472 → 9000 B slope 0.29 ns/B.
+
+Soak: `e` at 1472 B after `c` and `T c`, 19:48:43–19:53:45 (302 s).
+
+| item | result |
+|---|---|
+| verdict / rate | `LOOPBACK-ECHO: PASS` at 11 s, no FAIL, no link-down; 100.00 Gb/s line, 95.71 Gb/s payload every table from 2 s |
+| gen TX / chk RX | 1,228,045,072 / 1,228,045,072 (1.81 TB payload), 0/0/0 errors |
+| CMAC | RX 2,456,090,144 good, 0 bad FCS, 0 error; TX 2,456,090,144 good, 1,228,045,072 TX timestamps; no RS-FEC counters on this target |
+| zircon_nic | RX_FRAMES = TX_FRAMES = 2,456,090,144; RX_ECHO = TX_ECHO = 1,228,045,072; bad, fifo, L3/L4 csum, raw / sock / echo drop, TX oversize, STATUS all 0 |
+| latency bank 0 | 1,228,045,072 samples, min 1220 / mean 7510.8 / max 7540 ns, stddev 5.3 (queueing, as above); LAT_STATUS 0, stale / lost / ovf 0 |
+
+Jumbo: 9000 B payloads (9046 B frames) pass end to end through the CMAC (`L 0` at line rate,
+`e`, paced echoes; 0 errors, 0 drops), so the CMAC's static maximum frame length is ≥ 9046 B
+(§1.1). The exact limit was not probed.
+
 ## 13. Revision history of `zircon_nic` and the design
 
 | version (VERSION) | date | what changed |
@@ -1076,6 +1713,8 @@ Host round-trip times in the same run (1.3.0 Phase B, 2026-09-25 07:15; one Pyth
 | 1.1.0 (0x00010100) | 2026-09-24 | Review fixes: `mrmac_rx_packer` replaces the RX adapter + width converter (lost beats: frames cut at 48 bytes and merged); per-path drop-when-full RX FIFOs (no head-of-line blocking) with RX_RAW_DROP / RX_SOCK_DROP / RX_ECHO_DROP; frames cut by a MAC-side reset dropped and no stale replay; non-zero Ethernet padding no longer fails the UDP check; `tx_len_guard` and TX_OVERSIZE_DROP (a ≥ 32 KB UI transfer used to wedge TX); STATUS b4 / b5. |
 | 1.2.0 (0x00010200) | 2026-09-24 | Second QSFP port (`ports: 2`; port 0's addresses and IRQs unchanged); hardware UDP generator and checker (`GEN_EN`, 0x090..0x0E0), rate meters (0x0E4..0x0FC); two-stage `tx_meta_builder`, 16 cycles per packet instead of 21 (TX capacity 16.7 instead of 14.3 Mpps; 100G line rate from 684 instead of 809 B payloads); `STAT_CLR` also clears GEN_TX_* / CHK_*. Software: both ports, loopback tests `l` / `e` / `L`, auto-start, no automatic FEC fallback. |
 | 1.3.0 (0x00010300) | 2026-09-25 | Latency measurement: MRMAC 2-step 1588 timestamping on both ports, 250 MHz `ts_clk` and `ptp_systimer`; `s_axis_mac_rx_tuser` widened to 49 bits (RX timestamp) and new ports `m_axis_tx_ptp`, `tx_ptp_tstamp_*`; ZRXT / ZTXT descriptors on UI0 (off by default: the UI0 formats are unchanged unless LAT_CTRL.RAW_RX_DESC / RAW_TX_DESC are set); `latency_stats` with registers 0x100..0x118 and the 0x200..0x7FF snapshot; TX egress instantiated as its parts. Software: `T` report, UDP 5002 statistics service, TCP echo timestamps, lwIP TCP window 32 KB, per-port address modes (`i`). |
+
+| 1.3.0 (unchanged), kcu116 target | 2026-09-25 | New target `kcu116`: QSFP port 0 on the KCU116 HPC, the KU5P's CMACE4 through Taxi's `taxi_eth_mac_100g_us` (RS-FEC fixed on) behind the new MIT shim `zircon_cmac_us` (VERSION `0x00010000`: fabric timestamps, registers, GT APB window; §6c), block design `bd_microblaze.tcl` (MicroBlaze, DDR4, 256 KB LMB; §6b), `kcu116.xdc`, `cmac_sources.tcl`, `cfgmem.tcl` and the QSPI `.mcs`. `zircon_nic` itself is unchanged. Software: `mac.h` MAC abstraction with the `mrmac.c` / `cmac_taxi.c` backends, `timebase.[ch]`, MicroBlaze console / DMA / cache / linker support; the Versal build is unchanged. xsim: `tb_zircon_cmac_us.sv`. |
 
 Software written for 1.2.0 runs unchanged on 1.3.0 (LAT_CTRL resets to 0, so UI0 carries plain
 frames); `echo_server` reads VERSION and enables the latency features only from 1.3.0.

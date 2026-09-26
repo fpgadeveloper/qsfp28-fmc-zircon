@@ -60,6 +60,12 @@
  * then read the live state), as the source design. With RS-FEC the MRMAC
  * additionally reports FEC alignment / lane lock in STAT_RX_FEC_*_STATUS.
  */
+#include "hw_config.h"
+
+/* Versal MRMAC backend of mac.h; the CMAC targets (HW_MAC_CMAC) use
+ * cmac_taxi.c instead and build nothing from this file */
+#if !defined(HW_MAC_CMAC)
+
 #include <stdio.h>
 #include "console.h"
 #include "xil_io.h"
@@ -465,3 +471,5 @@ void mrmac_tick(UINTPTR port_base, mrmac_stats_t *t)
 	t->fec_corrected_cw += rd48(port_base, MRMAC_STAT_RX_FEC_CORR_CW);
 	t->fec_uncorrected_cw += rd48(port_base, MRMAC_STAT_RX_FEC_UNCORR_CW);
 }
+
+#endif /* !HW_MAC_CMAC */

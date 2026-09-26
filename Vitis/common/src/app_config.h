@@ -142,22 +142,26 @@
 #define LOOPBACK_VERDICT_S     10
 #endif
 
-/* ---- MRMAC FEC ---------------------------------------------------------------
- * MRMAC_FEC_KEEP  : leave FEC_CONFIGURATION_REG1 as the block design set it
- * MRMAC_FEC_OFF   : no FEC (CL82 PCS only)
- * MRMAC_FEC_RS528 : clause 91 RS(528,514) "KR4" - what 100GBASE-CR4/SR4/LR4
- *                   partners (e.g. Intel E810 in FEC auto) expect
- * MRMAC_FEC_RS544 : RS(544,514) "KP4"
- * The design's MRMAC is generated with RS(528,514); writing the same value is
- * harmless. With FEC_FALLBACK_MS non-zero the app alternates between the
- * chosen mode and FEC off every FEC_FALLBACK_MS while the link stays down, so
- * a partner forced to either mode still links. The default is 0 (no
- * automatic fallback): in a port 0 <-> port 1 loopback both ports must stay
- * in RS-FEC, and a port that had fallen back to FEC off while waiting would
- * never link to the other. The FEC mode of both ports can be cycled at
- * runtime by typing 'f' on the console. */
+/* ---- MAC FEC ------------------------------------------------------------------
+ * MAC_FEC_KEEP  : leave the MRMAC's FEC_CONFIGURATION_REG1 as the block design
+ *                 set it
+ * MAC_FEC_OFF   : no FEC (CL82 PCS only)
+ * MAC_FEC_RS528 : clause 91 RS(528,514) "KR4" - what 100GBASE-CR4/SR4/LR4
+ *                 partners (e.g. Intel E810 in FEC auto) expect
+ * MAC_FEC_RS544 : RS(544,514) "KP4"
+ * (The older MRMAC_FEC_* spellings are accepted too.)
+ * Versal MRMAC: the design's MRMAC is generated with RS(528,514); writing the
+ * same value is harmless. With FEC_FALLBACK_MS non-zero the app alternates
+ * between the chosen mode and FEC off every FEC_FALLBACK_MS while the link
+ * stays down, so a partner forced to either mode still links. The default is
+ * 0 (no automatic fallback): in a port 0 <-> port 1 loopback both ports must
+ * stay in RS-FEC, and a port that had fallen back to FEC off while waiting
+ * would never link to the other. The FEC mode of both ports can be cycled at
+ * runtime by typing 'f' on the console.
+ * UltraScale+ CMAC (kcu116): RS(528,514) is fixed in the Taxi MAC wrapper;
+ * APP_FEC_MODE, FEC_FALLBACK_MS and 'f' have no effect. */
 #ifndef APP_FEC_MODE
-#define APP_FEC_MODE       MRMAC_FEC_RS528
+#define APP_FEC_MODE       MAC_FEC_RS528
 #endif
 #ifndef FEC_FALLBACK_MS
 #define FEC_FALLBACK_MS    0
@@ -169,9 +173,9 @@
 #define LINK_DIAG_MS       30000
 #endif
 
-/* While the link is down the MRMAC core/serdes reset is re-issued every
- * LINK_RETRY_MS (the GT does not re-align on a partner that appears after
- * the last reset). */
+/* While the link is down the MAC reset is re-issued every LINK_RETRY_MS
+ * (MRMAC: core/serdes reset, the GT does not re-align on a partner that
+ * appears after the last reset; CMAC: an RX datapath reset pulse). */
 #ifndef LINK_RETRY_MS
 #define LINK_RETRY_MS      2000
 #endif

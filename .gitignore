@@ -21,6 +21,7 @@ bootimages/
 **/__pycache__/
 # UPDATER START
 Vivado/vck190_fmcp1/
+Vivado/kcu116/
 # UPDATER END
 dfx_runtime.txt
 .repo.yaml

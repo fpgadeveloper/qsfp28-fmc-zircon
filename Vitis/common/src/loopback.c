@@ -204,7 +204,7 @@ static void print_table_rows(u32 now)
 		}
 		con_printf("P%-3d %-4s %-11s %14llu %14llu %8llu %13llu %8llu %8s %8s %8s %8s\r\n",
 			   p, pt->link_up ? "up" : "down",
-			   mrmac_fec_name(mrmac_get_fec(pt->hw.mrmac)),
+			   mac_fec_name(mac_get_fec(&pt->hw)),
 			   (unsigned long long)a->tx_pkts, (unsigned long long)a->rx_pkts,
 			   (unsigned long long)a->seq_err, (unsigned long long)a->bit_err,
 			   (unsigned long long)a->len_err,

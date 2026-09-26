@@ -1,7 +1,10 @@
 # Register map
 
-`zircon_nic_0` (port 0) has a 4 KB AXI4-Lite register window at **`0x800A_0000`** on the CIPS
-`M_AXI_LPD` bus, and `zircon_nic_1` (port 1) the same window at **`0x801A_0000`**. The registers are 32 bits wide, little-endian, and addressed by byte offset. This page
+On the VCK190, `zircon_nic_0` (port 0) has a 4 KB AXI4-Lite register window at
+**`0x800A_0000`** on the CIPS `M_AXI_LPD` bus, and `zircon_nic_1` (port 1) the same window at
+**`0x801A_0000`**. On the KCU116 (port 0 only), `zircon_nic_0` is at **`0x440A_0000`** on the
+MicroBlaze data bus. The block and its registers are the same on both targets. The registers are
+32 bits wide, little-endian, and addressed by byte offset. This page
 documents version **1.3.0** of the block (`VERSION` = `0x00010300`). The register file is
 implemented in `Vivado/src/hdl/zircon_regs.sv`. The contract it implements is §3.3 and §5 of
 `docs/DESIGN_SPEC.md`.
@@ -117,6 +120,9 @@ programmed the addresses and enabled it.
 | 3 | `TX_META_ERR` | R, sticky until reset | An internal transmit metadata FIFO overflowed. Must never be set. |
 | 4 | `RX_PACK_STALL` | W1C, sticky | The MRMAC receive packer (`mrmac_rx_packer`) saw its output back-pressured. Only expected while the MAC-side receive FIFO is in reset (link down/up). |
 | 5 | `RX_PACK_OVF` | W1C, sticky | The MRMAC receive packer had to drop beats. The frames concerned were delivered marked bad and dropped (counted in `RX_BAD_FRAME`). Must not be set in normal operation; please report it. |
+
+Bits 4 and 5 always read 0 on the KCU116, which has no receive packer (the CMAC delivers 64-byte
+beats directly).
 
 Write 1 to a W1C bit to clear it (for example `0x31` clears bits 0, 4 and 5).
 
@@ -281,8 +287,10 @@ The block measures the latency of frames it transmits in reply to frames it rece
 IEEE 1588 timestamps of the MRMAC: **latency = TX timestamp − RX timestamp**. The MRMAC takes
 both timestamps at the first PCS block of the frame, so the latency runs from the start of the
 request at the receive PCS to the start of the reply at the transmit PCS. It includes every
-buffer in between and excludes the serdes, PCS and RS-FEC delays. Two banks of statistics are
-kept:
+buffer in between and excludes the serdes, PCS and RS-FEC delays. On the KCU116 the timestamps
+come from the CMAC shim instead, in the same format, taken at the start of the frame at the
+CMAC's client interface (see [KCU116 timestamps](design.md#timestamps-on-the-kcu116)); the
+registers below work the same way. Two banks of statistics are kept:
 
 * **Bank 0, hardware UDP echo.** With `LAT_CTRL.EN` set, every echo reply is timestamped.
 * **Bank 1, software path.** Software sends a reply on UI0 behind a `ZTXT` descriptor that
@@ -321,7 +329,8 @@ move samples already counted: clear the banks afterwards.
 `LAT_STALE_CNT`, `LAT_LOST_CNT` and `LAT_OVF_CNT` count the same events; `CTRL.STAT_CLR`
 zeroes them. The transmit adapter in front of the MRMAC has its own sticky flag, *PTP
 underrun*, for a frame that had to be sent without its timestamp request; the block design
-routes it to a GPIO input (see [design](design.md)).
+routes it to a GPIO input (see [design](design.md)). On the KCU116 the shim's
+`STICKY.PTP_UNDERRUN` bit plays that role.
 
 ### Snapshot registers
 

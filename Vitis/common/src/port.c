@@ -6,17 +6,18 @@
  *
  * Per port: zircon_nic registers (MAC = APP_MAC_ADDR + port, IPV4 follows
  * lwIP, ECHO_PORT 7, SOCK_LOCAL_PORT 5000, TTL 64, CHK_PORT 5001), the
- * MRMAC/GT bring-up (one-time GT reset through the port's own GT-control
- * GPIO, then the 100G + RS-FEC configuration, re-issued while the link is
- * down, with the FEC fallback), an lwIP netif on the raw path (addressed per
+ * MAC/GT bring-up through mac.h (Versal MRMAC: one-time GT reset through the
+ * port's own GT-control GPIO, then the 100G + RS-FEC configuration, re-issued
+ * while the link is down, with the FEC fallback; CMAC: shim reset release,
+ * RX reset pulses while the link is down), an lwIP netif on the raw path (addressed per
  * the port's address mode: DHCP with a static fallback, static only or DHCP
  * only), the hardware socket demo, and the datapath enable.
  */
+#include <stdio.h>
 #include <string.h>
 
 #include "xparameters.h"
 #include "xil_io.h"
-#include "xiltimer.h"
 #include "sleep.h"
 
 #include "lwip/netif.h"
@@ -31,10 +32,7 @@
 #include "console.h"
 #include "latency.h"
 #include "port.h"
-
-#ifndef COUNTS_PER_SECOND
-#define COUNTS_PER_SECOND XPAR_CPU_TIMESTAMP_CLK_FREQ
-#endif
+#include "timebase.h"
 
 /* IP4_ADDR() with an "a, b, c, d" macro from app_config.h */
 #define IP4_ADDR_Q(dst, ...) IP4_ADDR(dst, __VA_ARGS__)
@@ -53,7 +51,7 @@
 #define QSFP_MODPRSL        (1u << 0)
 
 port_t ports[NUM_PORTS];
-mrmac_fec_t fec_mode = APP_FEC_MODE;
+mac_fec_t fec_mode = APP_FEC_MODE;
 
 static const hw_port_t hw_ports[NUM_PORTS] = HW_PORT_TABLE;
 static const u8 base_mac[6] = APP_MAC_ADDR;
@@ -63,10 +61,7 @@ static const u8 base_mac[6] = APP_MAC_ADDR;
 /* ------------------------------------------------------------------------ */
 u32 now_ms(void)
 {
-	XTime t;
-
-	XTime_GetTime(&t);
-	return (u32)(t / (COUNTS_PER_SECOND / 1000));
+	return timebase_ms();
 }
 
 /* bits per 1-s window / 10^7 = 1/100 Gb/s */
@@ -374,39 +369,51 @@ void port_addr_poll(port_t *p, u32 now)
 /* ------------------------------------------------------------------------ */
 /* Link                                                                       */
 /* ------------------------------------------------------------------------ */
+#if defined(HW_MAC_CMAC)
 static void print_link_up(port_t *p)
 {
-	mrmac_state_t st;
-	mrmac_fec_t fec = mrmac_get_fec(p->hw.mrmac);
+	mac_print_link_up(p->n, &p->hw);
+}
 
-	mrmac_get_state(p->hw.mrmac, &st);
-	if (fec == MRMAC_FEC_OFF)
+void port_print_link_diag(port_t *p)
+{
+	mac_print_link_diag(p->n, &p->hw);
+}
+#else
+static void print_link_up(port_t *p)
+{
+	mac_state_t st;
+	mac_fec_t fec = mac_get_fec(&p->hw);
+
+	mac_get_state(&p->hw, &st);
+	if (fec == MAC_FEC_OFF)
 		con_printf("Port %d: link up, 100 Gb/s, FEC off\r\n", p->n);
 	else
 		con_printf("Port %d: link up, 100 Gb/s, FEC %s (%s, lane lock 0x%x, FEC_CONFIGURATION_REG1 0x%lx)\r\n",
-			   p->n, mrmac_fec_name(fec), st.fec_aligned ? "aligned" : "NOT aligned",
+			   p->n, mac_fec_name(fec), st.fec_aligned ? "aligned" : "NOT aligned",
 			   st.fec_lane_lock, (unsigned long)st.fec_cfg);
 }
 
 void port_print_link_diag(port_t *p)
 {
-	mrmac_state_t st;
+	mac_state_t st;
 
-	mrmac_get_state(p->hw.mrmac, &st);
+	mac_get_state(&p->hw, &st);
 	con_printf("Port %d: link down: FEC %s, rx status 0x%08lx, block lock 0x%05lx, "
 		   "FEC aligned %d lane lock 0x%x%s%s%s\r\n",
-		   p->n, mrmac_fec_name(mrmac_get_fec(p->hw.mrmac)),
+		   p->n, mac_fec_name(mac_get_fec(&p->hw)),
 		   (unsigned long)st.rx_status, (unsigned long)(st.blk_lock & 0xFFFFF),
 		   st.fec_aligned, st.fec_lane_lock,
 		   st.local_fault ? ", local fault" : "",
 		   st.remote_fault ? ", remote fault" : "",
 		   st.hi_ber ? ", hi BER" : "");
 }
+#endif /* HW_MAC_CMAC */
 
-void port_mac_reinit(port_t *p, mrmac_fec_t fec)
+void port_mac_reinit(port_t *p, mac_fec_t fec)
 {
-	mrmac_port_init(p->hw.mrmac, fec);
-	if (fec != MRMAC_FEC_KEEP)
+	mac_port_init(&p->hw, fec);
+	if (fec != MAC_FEC_KEEP)
 		p->fec_try = fec;
 }
 
@@ -416,7 +423,7 @@ void port_link_poll(port_t *p, u32 now)
 
 	if (!p->ok)
 		return;
-	up = mrmac_port_link_up(p->hw.mrmac);
+	up = mac_link_up(&p->hw);
 	if (up && !p->link_up) {
 		print_link_up(p);
 		if (p->netif_ok)
@@ -442,13 +449,13 @@ void port_link_poll(port_t *p, u32 now)
 	if ((u32)(now - p->last_retry_ms) < LINK_RETRY_MS)
 		return;
 	p->last_retry_ms = now;
-#if FEC_FALLBACK_MS > 0
-	if (fec_mode != MRMAC_FEC_KEEP && fec_mode != MRMAC_FEC_OFF &&
+#if FEC_FALLBACK_MS > 0 && MAC_SUPPORTS_FEC_CHANGE
+	if (fec_mode != MAC_FEC_KEEP && fec_mode != MAC_FEC_OFF &&
 	    (u32)(now - p->last_fec_switch_ms) >= FEC_FALLBACK_MS) {
 		p->last_fec_switch_ms = now;
-		p->fec_try = (p->fec_try == MRMAC_FEC_OFF) ? fec_mode : MRMAC_FEC_OFF;
+		p->fec_try = (p->fec_try == MAC_FEC_OFF) ? fec_mode : MAC_FEC_OFF;
 		con_printf("Port %d: no link after %d s, trying FEC %s\r\n", p->n,
-			   (int)((now - p->link_down_since_ms) / 1000), mrmac_fec_name(p->fec_try));
+			   (int)((now - p->link_down_since_ms) / 1000), mac_fec_name(p->fec_try));
 		port_print_link_diag(p);
 	}
 #else
@@ -459,7 +466,7 @@ void port_link_poll(port_t *p, u32 now)
 		port_print_link_diag(p);
 	}
 #endif
-	port_mac_reinit(p, fec_mode == MRMAC_FEC_KEEP ? MRMAC_FEC_KEEP : p->fec_try);
+	port_mac_reinit(p, fec_mode == MAC_FEC_KEEP ? MAC_FEC_KEEP : p->fec_try);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -523,20 +530,35 @@ int port_hw_init(port_t *p, int n)
 		zircon_chk_config(&p->zircon, CHK_UDP_PORT);
 	}
 
+#if defined(HW_MAC_CMAC)
+	/* CMAC: the shim releases the GT + CMAC reset now that the Si5328 runs
+	 * (main() programmed it), then TX/RX enable + an RX datapath reset.
+	 * RS(528,514) is fixed in the Taxi wrapper. */
+	if (mac_hw_reset(&p->hw) != 0) {
+		con_printf("Port %d: CMAC bring-up failed (no refclk?)\r\n", n);
+		ok = 0;
+	}
+	if (fec_mode != MAC_FEC_RS528 && fec_mode != MAC_FEC_KEEP)
+		con_printf("NOTE: Port %d: APP_FEC_MODE %s ignored: FEC fixed at RS(528,514) on this target\r\n",
+			   n, mac_fec_name(fec_mode));
+	port_mac_reinit(p, MAC_FEC_RS528);
+	mac_print_config(n, &p->hw);
+#else
 	/* MRMAC: one-time GT reset (the port's own GT-control GPIO), then
 	 * 100G + FEC configuration */
-	if (mrmac_gt_reset(p->hw.gpio_gt) != 0) {
+	if (mac_hw_reset(&p->hw) != 0) {
 		con_printf("Port %d: GT reset-done timeout (no refclk?)\r\n", n);
 		ok = 0;
 	}
 	port_mac_reinit(p, fec_mode);
-	if (fec_mode == MRMAC_FEC_KEEP)
-		p->fec_try = mrmac_get_fec(p->hw.mrmac);
+	if (fec_mode == MAC_FEC_KEEP)
+		p->fec_try = mac_get_fec(&p->hw);
 	con_printf("Port %d: MRMAC at 0x%08lx configured: 100GE, FEC %s (FEC_CONFIGURATION_REG1 0x%08lx), "
 		   "RX max frame %lu B\r\n",
-		   n, (unsigned long)p->hw.mrmac, mrmac_fec_name(mrmac_get_fec(p->hw.mrmac)),
-		   (unsigned long)mrmac_fec_cfg_raw(p->hw.mrmac),
-		   (unsigned long)mrmac_rx_max_len(p->hw.mrmac));
+		   n, (unsigned long)p->hw.mac, mac_fec_name(mac_get_fec(&p->hw)),
+		   (unsigned long)mrmac_fec_cfg_raw(p->hw.mac),
+		   (unsigned long)mrmac_rx_max_len(p->hw.mac));
+#endif
 	if (p->has_lat)
 		lat_print_1588(p);
 	p->link_down_since_ms = p->last_retry_ms = p->last_fec_switch_ms = now_ms();
@@ -627,8 +649,8 @@ void port_rate_poll(port_t *p, u32 now)
 void port_print_status(port_t *p, int force, u32 now)
 {
 	port_status_snapshot_t s;
-	const mrmac_stats_t *ms = &p->mstats;
-	char lat[96];
+	const mac_stats_t *ms = &p->mstats;
+	char lat[96], fecc[64];
 	int changed;
 
 	if (!p->ok)
@@ -646,14 +668,20 @@ void port_print_status(port_t *p, int force, u32 now)
 	p->last_status = s;
 	p->last_status_ms = now;
 
-	mrmac_tick(p->hw.mrmac, &p->mstats);
+	mac_tick(&p->hw, &p->mstats);
 	lat_status_summary(p, lat, sizeof(lat));
-	con_printf("[%5lu s] P%d link %s FEC %s cw corr %llu uncorr %llu | rx %lu raw %lu echo %lu sock %lu"
+#if defined(HW_MAC_CMAC)
+	/* the Taxi CMAC wrapper exposes no RS-FEC counters */
+	snprintf(fecc, sizeof(fecc), "cw corr n/a uncorr n/a");
+#else
+	snprintf(fecc, sizeof(fecc), "cw corr %llu uncorr %llu",
+		 (unsigned long long)ms->fec_corrected_cw, (unsigned long long)ms->fec_uncorrected_cw);
+#endif
+	con_printf("[%5lu s] P%d link %s FEC %s %s | rx %lu raw %lu echo %lu sock %lu"
 		   " | tx %lu raw %lu echo %lu sock %lu | drop fifo %lu bad %lu csum %lu/%lu"
 		   " raw %lu sock %lu echo %lu txbig %lu st 0x%lx%s\r\n",
 		   (unsigned long)(now / 1000), p->n, p->link_up ? "UP" : "DOWN",
-		   mrmac_fec_name(mrmac_get_fec(p->hw.mrmac)),
-		   (unsigned long long)ms->fec_corrected_cw, (unsigned long long)ms->fec_uncorrected_cw,
+		   mac_fec_name(mac_get_fec(&p->hw)), fecc,
 		   (unsigned long)s.zc.rx_frames, (unsigned long)s.zc.rx_raw,
 		   (unsigned long)s.zc.rx_echo, (unsigned long)s.zc.rx_sock,
 		   (unsigned long)s.zc.tx_frames, (unsigned long)s.zc.tx_raw,
@@ -683,9 +711,19 @@ void port_print_status(port_t *p, int force, u32 now)
 				   (unsigned long)s.ns.rx_ts_frames, (unsigned long)s.ns.rx_ts_missing,
 				   (unsigned long)s.ns.rx_ts_len_err, (unsigned long)s.ns.tx_ts_req);
 	}
+#if defined(HW_MAC_CMAC)
+	if (force)
+		con_printf("          P%d CMAC rx pkts %llu good %llu bad FCS %llu err %llu | tx pkts %llu good %llu"
+			   " timestamps %llu\r\n",
+			   p->n, (unsigned long long)ms->rx_packets,
+			   (unsigned long long)ms->rx_good_packets, (unsigned long long)ms->rx_bad_fcs,
+			   (unsigned long long)ms->rx_err_frames, (unsigned long long)ms->tx_packets,
+			   (unsigned long long)ms->tx_good_packets, (unsigned long long)ms->tx_ts_returned);
+#else
 	if (force)
 		con_printf("          P%d MRMAC rx pkts %llu good %llu bad FCS %llu | tx pkts %llu good %llu\r\n",
 			   p->n, (unsigned long long)ms->rx_packets,
 			   (unsigned long long)ms->rx_good_packets, (unsigned long long)ms->rx_bad_fcs,
 			   (unsigned long long)ms->tx_packets, (unsigned long long)ms->tx_good_packets);
+#endif
 }

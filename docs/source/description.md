@@ -10,8 +10,10 @@ design. The design has **two identical 100G
 ports**, one for each QSFP28 cage of the card, and each port has its own MAC, its own
 `zircon_nic` and its own pair of DMAs.
 
-This page describes the architecture of the design: what the blocks are, how a frame travels
-through them, which clocks and widths they use, and how fast they can go. The full
+This page describes the architecture of the design on the VCK190: what the blocks are, how a
+frame travels through them, which clocks and widths they use, and how fast they can go. The
+KCU116 target uses the same `zircon_nic`; what differs there is described in
+[KCU116 target](#kcu116-target) at the end of the page. The full
 block-design reference (address map, interrupts, resets, MRMAC settings) is on the
 [Hardware design](design.md) page.
 
@@ -369,5 +371,43 @@ the [echo server](echo_server.md):
 
 The hardware UDP echo (UI1) needs no software at all once the registers are set, and the
 generator and checker need software only to start them and to read their counters.
+
+## KCU116 target
+
+The `kcu116` target runs the same design on the Kintex UltraScale+ KCU116, with the 2x QSFP28 FMC
+on the board's HPC connector. That connector wires the transceiver lanes of **one QSFP28 port
+(port 0)**, so the design has one 100G port. What stays the same: `zircon_nic` (the same RTL,
+version 1.3.0, the same [registers](registers.md)), the 300 MHz core clock and therefore the
+same [throughput limits](#throughput), the hardware UDP echo, socket, generator, checker, rate
+meters and latency statistics, the bare-metal application and its console, and the host test
+scripts. What differs:
+
+* **MAC.** The XCKU5P has an integrated 100G Ethernet MAC (CMAC) with RS-FEC, which the design
+  uses through the Taxi library's own 100G CMAC wrapper (`taxi_eth_mac_100g_us`, unmodified). A
+  small Opsero MIT shim, `zircon_cmac_us`, connects it to `zircon_nic`. The CMAC's client
+  interface is already 512 bits wide, so there is no RX packer or TX width converter, and the MAC
+  side of `zircon_nic` runs on the CMAC's own 322.27 MHz clocks.
+* **RS-FEC is fixed on** in the Taxi wrapper, so the link partner must use RS-FEC (a partner in
+  FEC "auto" does), and there are no FEC codeword counters.
+* **Latency timestamps** are taken in the shim, at the CMAC's client interface, because the Taxi
+  wrapper provides none. They are quantised to 4 ns and exclude the CMAC's own pipeline, so the
+  KCU116 latency figures cannot be compared directly with the VCK190's (see
+  [KCU116 timestamps](design.md#timestamps-on-the-kcu116)).
+* **Processor.** A MicroBlaze soft processor at 100 MHz, with 32 KB caches, 256 KB of on-chip
+  local memory for the application and 1 GB of DDR4 for the lwIP buffers and DMA rings. It is
+  the control plane, exactly as the Versal PS is on the VCK190, but it is much slower: the
+  software TCP echo takes about 0.1 to 0.5 ms instead of 7 to 10 µs. The hardware paths do not
+  depend on it.
+* **Boot.** The application is embedded in the bitstream (`zircon_boot.bit`), which is loaded
+  over JTAG or programmed into the KCU116's QSPI flash (`zircon_boot.mcs`) so that the board
+  boots the design at power-on. See [Build instructions](build_instructions.md#kcu116-bitstream-and-qspi-flash).
+* **Testing.** With one port there is no cross-port loopback test. The KCU116 is tested with a
+  100G host (`scripts/zircon_echo_test.py`, `scripts/zircon_prbs_tool.py`), or with a QSFP28
+  loopback plug in port 0 (`L 0`: 100 Gb/s line rate from 726-byte payloads up, 9000-byte jumbo
+  payloads included, no errors). Results:
+  [Testing](testing.md#kcu116-port-0-microblaze-v130).
+
+The block design, address map and shim registers are on the
+[Hardware design](design.md#kcu116-block-design) page.
 
 [2x QSFP28 FMC]: https://docs.opsero.com/op120/datasheet/overview/

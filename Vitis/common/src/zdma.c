@@ -20,35 +20,63 @@
  *   - transmit bounce buffers are flushed after the CPU filled them.
  *   Every buffer is 64-byte aligned and a multiple of 64 bytes long, so no
  *   maintenance operation ever touches a neighbouring object.
+ *
+ * MicroBlaze (kcu116): no MMU to remap with, so the BD rings stay cached and
+ * the AXI DMA driver's XAXIDMA_CACHE_FLUSH/INVALIDATE macros (compiled in on
+ * every non-aarch64 core, xaxidma_bd.h) maintain them inside
+ * XAxiDma_BdRingToHw()/FromHw() - the pattern of the AMD lwIP port's
+ * xaxiemacif_dma.c. BDs are BD_ALIGNMENT (128 B) apart, so no two share a
+ * cache line. The buffers keep their explicit flush/invalidate calls, the
+ * barrier is "mbar 1" and addresses are 32-bit (UINTPTR).
  */
 #include <string.h>
 
 #include "xaxidma.h"
 #include "xil_cache.h"
-#include "xil_mmu.h"
 #include "console.h"
-#include "xpseudo_asm.h"
 #include "xstatus.h"
+#if defined(__aarch64__)
+#include "xil_mmu.h"
+#include "xpseudo_asm.h"
+#endif
 
 #include "zdma.h"
+
+#if defined(__MICROBLAZE__)
+/* MicroBlaze data-side barrier (what xil_io.h's DATA_SYNC expands to) */
+#define dsb() __asm__ __volatile__ ("mbar 1" ::: "memory")
+#endif
 
 #define BD_ALIGNMENT   (XAXIDMA_BD_MINIMUM_ALIGNMENT * 2)
 #define BD_SPACE_SIZE  0x200000        /* one 2 MB MMU block            */
 #define BD_RING_SPACE  0x10000         /* 64 KB per ring (256 x 128 B)  */
 
-static u8 bd_space[BD_SPACE_SIZE] __attribute__((aligned(BD_SPACE_SIZE)));
+/* aarch64: the whole block is one 2 MB MMU block, remapped non-cacheable.
+ * Elsewhere only the rings need BD alignment (mb-gcc also caps object
+ * alignment at 32 KB). */
+#if defined(__aarch64__)
+#define BD_SPACE_ALIGN BD_SPACE_SIZE
+#else
+#define BD_SPACE_ALIGN BD_ALIGNMENT
+#endif
+
+static u8 bd_space[BD_SPACE_SIZE] __attribute__((aligned(BD_SPACE_ALIGN)));
 static u32 bd_space_used;
+#if defined(__aarch64__)
 static int bd_space_mapped;
+#endif
 
 static u8 *bd_ring_alloc(void)
 {
 	u8 *p;
 
+#if defined(__aarch64__)
 	if (!bd_space_mapped) {
 		Xil_SetTlbAttributes((UINTPTR)bd_space, NORM_NONCACHE | INNER_SHAREABLE);
 		dsb();
 		bd_space_mapped = 1;
 	}
+#endif
 	if (bd_space_used + BD_RING_SPACE > BD_SPACE_SIZE)
 		return NULL;
 	p = &bd_space[bd_space_used];

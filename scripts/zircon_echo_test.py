@@ -42,10 +42,11 @@ Interface / addresses:
     zircon_echo_test.py --port 1 --from-log logs/_bench/vck190_journal.log
     zircon_echo_test.py 192.168.20.23 --only udp --udp-sizes all --jumbo
 
-Latency (zircon_nic 1.3.0): the board measures, with the MRMAC's IEEE 1588
-timestamps, the time from the first PCS block of a request on RX to the first
-PCS block of its reply on TX, for the hardware UDP echo (bank 0) and the
-software TCP echo (bank 1), and serves the statistics on UDP port 5002
+Latency (zircon_nic 1.3.0): the board measures, with hardware timestamps
+(VCK190: the MRMAC's IEEE 1588 timestamps at the PCS; KCU116: a fabric
+timestamp at the MAC client interface), the time from the first block of a
+request on RX to the first block of its reply on TX, for the hardware UDP echo
+(bank 0) and the software TCP echo (bank 1), and serves the statistics on UDP port 5002
 (Vitis/common/src/latency_wire.h). With --latency the script, after the
 normal tests, runs per size: clear the banks, N UDP and N TCP request/response
 exchanges with one request in flight (TCP_NODELAY), read the banks, and prints
@@ -620,7 +621,7 @@ def tcp_rtt_run(local_ip, board_ip, size, count, timeout):
 
 
 def test_latency(local_ip, board_ip, sizes, count, timeout):
-    res = Result("Latency (MRMAC 1588 timestamps, UDP 5002 statistics)")
+    res = Result("Latency (hardware timestamps, UDP 5002 statistics)")
     try:
         stat = lat_parse(lat_request(local_ip, board_ip, "STAT?", timeout))
     except (RuntimeError, ValueError) as e:

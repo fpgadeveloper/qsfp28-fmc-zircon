@@ -5,6 +5,10 @@
     {
       "label": "versal",
       "name": "Versal"
+    },
+    {
+      "label": "fpga",
+      "name": "FPGA"
     }
   ],
   "designs": [
@@ -26,6 +30,28 @@
       "yocto": false,
       "license": true,
       "ip_license": true
+    },
+    {
+      "publish": true,
+      "label": "kcu116",
+      "board": "KCU116",
+      "link": "https://www.xilinx.com/kcu116",
+      "url": "xilinx.com",
+      "boardname": "kcu116",
+      "bdscript": "microblaze",
+      "ports": 1,
+      "fec": "rs",
+      "linkspeed": "100",
+      "connector": "HPC",
+      "group": "fpga",
+      "baremetal": true,
+      "petalinux": false,
+      "yocto": false,
+      "license": false,
+      "ip_license": true,
+      "cfgmem": true,
+      "flashsize": "128",
+      "flashintf": "SPIx4"
     }
   ]
 }

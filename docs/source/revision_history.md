@@ -1,5 +1,37 @@
 # Revision History
 
+## 2025.2 — version 1.3, KCU116 target (zircon_nic 1.3.0, unchanged), 2026-09-25
+
+A second target, `kcu116`: QSFP28 port 0 of the 2x QSFP28 FMC on the KCU116's HPC connector
+(Kintex UltraScale+ XCKU5P), bare-metal on a MicroBlaze. See
+[KCU116 target](description.md#kcu116-target).
+
+* Hardware: the XCKU5P's integrated 100G CMAC (CAUI-4, RS-FEC fixed on) through the Taxi
+  library's `taxi_eth_mac_100g_us` wrapper, unmodified, behind a new MIT shim `zircon_cmac_us`
+  that adds fabric timestamps for the latency measurement, a register block and access to the
+  transceiver control bus (see [KCU116 block design](design.md#kcu116-block-design)). New block
+  design `bd_microblaze.tcl`: MicroBlaze with 256 KB of local memory, DDR4, two AXI DMAs, UART
+  Lite, two AXI timers. `zircon_nic` is the same RTL as on the VCK190 (`VERSION` stays
+  `0x00010300`).
+* Build: `./build.sh all --target kcu116` also writes the QSPI flash image `zircon_boot.mcs`
+  (128 MB MT25QU01G, SPI x4), so the board boots the design at power-on (see
+  [Build instructions](build_instructions.md#kcu116-bitstream-and-qspi-flash)). Builds with the
+  free Vivado Standard edition plus AMD's no-charge CMAC license.
+* Echo server: one source tree for both targets, with a MAC abstraction (`mac.h`: the MRMAC and
+  the Taxi CMAC backends), a 64-bit timebase on an AXI timer, the UART Lite console and the
+  MicroBlaze cache and memory layout. The VCK190 build is unchanged.
+* Simulation: a testbench for the CMAC shim with `zircon_nic` (`tb_zircon_cmac_us.sv`).
+* Measured on the KCU116 with a 100G host: all host tests pass; hardware UDP echo latency
+  385 ns (64 B) and 718 ns (1472 B), MAC client to MAC client; 12 million echoes with no loss;
+  generator and checker against the host with no errors; boot from QSPI. See
+  [Testing](testing.md#kcu116-port-0-microblaze-v130).
+* Measured on the KCU116 with a QSFP28 loopback plug: `L 0` at 100 Gb/s line rate from 726-byte
+  payloads up and 16.67 Mpps below, `e` through the plug, a 5-minute soak and 9000-byte jumbo
+  payloads, all with no errors. See
+  [Testing](testing.md#loopback-plug-port-0-2026-09-25-19401954).
+* Limits of this target: one port (no cross-port loopback test), FEC not switchable, maximum frame
+  length fixed at the CMAC default (9000-byte payloads verified).
+
 ## 2025.2 — version 1.3 (zircon_nic 1.3.0), 2026-09-25
 
 Latency measurement in hardware, from the MRMAC's IEEE 1588 timestamps (see
@@ -79,8 +111,7 @@ First release of the 2x QSFP28 FMC Zircon Ethernet reference design.
 * Built for Vivado / Vitis 2025.2. **Bare-metal only**: no Linux (PetaLinux or Yocto) flow, no
   Makefiles; builds are driven by the cross-platform runner (`build.py` / `build.sh` /
   `build.bat`) on Windows or Linux.
-* Target: VCK190 (`vck190_fmcp1`), 2x QSFP28 FMC on FMCP1, QSFP28 port 0 at 100 Gb/s. ZCU106 and
-  KCU116 targets are planned.
+* Target: VCK190 (`vck190_fmcp1`), 2x QSFP28 FMC on FMCP1, QSFP28 port 0 at 100 Gb/s.
 * Hardware: Versal MRMAC, 1x100GE CAUI-4 with RS-FEC (clause 91, RS(528,514)), feeding the
   `zircon_nic` module reference: the Zircon IP stack from the Taxi transport library (git
   submodule `submodules/taxi`, pinned at `cc70b27`, CERN-OHL-S-2.0) plus Opsero's MIT glue (header

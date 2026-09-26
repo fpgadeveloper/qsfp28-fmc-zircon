@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT
  *
- * port.h - one QSFP28 port of the zircon design: MRMAC + GT, zircon_nic,
+ * port.h - one QSFP28 port of the zircon design: 100G MAC + GT (mac.h), zircon_nic,
  *          raw-path lwIP netif (DHCP / static, per-port address mode),
  *          hardware echo and socket
  *
@@ -17,7 +17,7 @@
 #include "lwip/netif.h"
 
 #include "hw_config.h"
-#include "mrmac.h"
+#include "mac.h"
 #include "zircon.h"
 #include "zircon_netif.h"
 #include "sock_demo.h"
@@ -62,9 +62,9 @@ typedef struct port {
 	/* link */
 	int link_up;
 	int link_changed;             /* since the last addr_poll             */
-	mrmac_fec_t fec_try;          /* currently programmed FEC mode        */
+	mac_fec_t fec_try;            /* currently programmed FEC mode        */
 	u32 link_down_since_ms, last_retry_ms, last_fec_switch_ms;
-	mrmac_stats_t mstats;         /* MRMAC statistics totals              */
+	mac_stats_t mstats;           /* MAC statistics totals                */
 
 	/* periodic status line */
 	port_status_snapshot_t last_status;
@@ -78,12 +78,12 @@ typedef struct port {
 } port_t;
 
 extern port_t ports[NUM_PORTS];
-extern mrmac_fec_t fec_mode;      /* the FEC mode programmed on every port */
+extern mac_fec_t fec_mode;        /* the FEC mode programmed on every port */
 
 u32  now_ms(void);
 
 /* Bring-up, in this order: port_hw_init (zircon_nic registers, GT reset,
- * MRMAC 100G/FEC) for every port, lwip_init(), then port_net_init (netif,
+ * MAC 100G/FEC) for every port, lwip_init(), then port_net_init (netif,
  * socket DMA, datapath enable). Both return 0 on success. */
 int  port_hw_init(port_t *p, int n);
 int  port_net_init(port_t *p);
@@ -94,7 +94,7 @@ void port_addr_poll(port_t *p, u32 now);     /* DHCP / static per address mode  
 void port_check(port_t *p);                  /* DMA error recovery, ~1 Hz        */
 void port_rate_poll(port_t *p, u32 now);     /* read a new rate-meter window     */
 
-void port_mac_reinit(port_t *p, mrmac_fec_t fec);
+void port_mac_reinit(port_t *p, mac_fec_t fec);
 void port_print_status(port_t *p, int force, u32 now);
 void port_print_link_diag(port_t *p);
 /* Make sure the port has an IPv4 address: in IP_MODE_DHCP_THEN_STATIC stop

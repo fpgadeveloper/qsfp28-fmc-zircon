@@ -38,6 +38,7 @@ set_param board.repoPaths [get_property LOCAL_ROOT_DIR [xhub::get_xstores xilinx
 #  <label> { <url> <boardname> <bdscript> { <ports> } <fec> })
 # UPDATER START
 dict set target_dict vck190_fmcp1 { xilinx.com vck190 versal { 0 1 } rs }
+dict set target_dict kcu116 { xilinx.com kcu116 microblaze { 0 } rs }
 # UPDATER END
 
 # Function to display the options and get user input
@@ -184,7 +185,13 @@ if { [info exists zircon_rtl] } {
   foreach f $zircon_rtl { add_src_once sources_1 $f }
 }
 foreach f [lsort [glob -nocomplain [file normalize "$origin_dir/src/hdl/mrmac_*.v"]]] { add_src_once sources_1 $f }
-foreach f [lsort [glob -nocomplain [file normalize "$origin_dir/src/hdl/*.sv"] [file normalize "$origin_dir/src/hdl/*.v"]]] { add_src_once sources_1 $f }
+# The UltraScale+ CMAC shim (zircon_cmac_us*, ts_gray_sync) needs the Taxi 100G
+# wrapper and its IP: scripts/cmac_sources.tcl adds it on MicroBlaze targets only.
+set cmac_shim_files { zircon_cmac_us.v zircon_cmac_us_core.sv ts_gray_sync.sv }
+foreach f [lsort [glob -nocomplain [file normalize "$origin_dir/src/hdl/*.sv"] [file normalize "$origin_dir/src/hdl/*.v"]]] {
+  if { [lsearch -exact $cmac_shim_files [file tail $f]] >= 0 } { continue }
+  add_src_once sources_1 $f
+}
 set sv_files [get_files -quiet -of_objects [get_filesets sources_1] *.sv]
 if { [llength $sv_files] > 0 } { set_property file_type SystemVerilog $sv_files }
 # Taxi's Tcl timing constraints locate cells by ORIG_REF_NAME: implementation only
@@ -193,6 +200,20 @@ if { [info exists zircon_xdc] } {
     add_src_once constrs_1 $f
     set_property used_in_synthesis false [get_files -of_objects [get_filesets constrs_1] [file normalize $f]]
   }
+}
+
+# ---------------------------------------------------------------------------
+# MicroBlaze (UltraScale+ CMAC) targets: the zircon_cmac_us module reference
+# wraps Taxi's 100G CMAC wrapper (taxi_eth_mac_100g_us), which instantiates two
+# project IPs: the cmac_usplus hard MAC and the GTY transceiver wizards. They
+# are created by Taxi's own (unmodified) IP scripts, then scripts/cmac_sources.tcl
+# adds the Taxi 100G RTL (expanded from its .f lists), the shim and their
+# implementation-only constraint scripts. The Versal flow does not use them.
+# ---------------------------------------------------------------------------
+if { $bd_script eq "microblaze" } {
+  source "$taxi_dir/src/eth/rtl/us/taxi_eth_mac_100g_us_cmace4.tcl"
+  source "$taxi_dir/src/eth/rtl/us/taxi_eth_mac_100g_us_gty_322.tcl"
+  source [file normalize "$origin_dir/scripts/cmac_sources.tcl"]
 }
 
 # Create 'constrs_1' fileset (if not found)
@@ -248,9 +269,22 @@ if {[string equal [get_runs -quiet impl_1] ""]} {
   set_property flow "Vivado Implementation 2025" [get_runs impl_1]
 }
 set obj [get_runs impl_1]
-# Versal: the bitstream step is write_device_image (PDI)
-set_property -name "steps.write_device_image.args.readback_file" -value "0" -objects $obj
-set_property -name "steps.write_device_image.args.verbose" -value "0" -objects $obj
+if { $bd_script eq "versal" } {
+  # Versal: the bitstream step is write_device_image (PDI)
+  set_property -name "steps.write_device_image.args.readback_file" -value "0" -objects $obj
+  set_property -name "steps.write_device_image.args.verbose" -value "0" -objects $obj
+} else {
+  # MicroBlaze (Kintex UltraScale+): the bitstream step is write_bitstream.
+  # The zircon core runs at 300 MHz on a -2 part: use the physical
+  # optimisation strategy, and repair the hold violations between the MIG's
+  # related 100 MHz (addn_ui_clkout1) and ~300 MHz (c0_ddr4_ui_clk) clocks
+  # across the DDR SmartConnect with a post-route hold-fix pass.
+  set_property strategy "Performance_ExplorePostRoutePhysOpt" $obj
+  set_property -name "steps.write_bitstream.args.readback_file" -value "0" -objects $obj
+  set_property -name "steps.write_bitstream.args.verbose" -value "0" -objects $obj
+  set_property -name "steps.post_route_phys_opt_design.is_enabled" -value "1" -objects $obj
+  set_property -name "steps.post_route_phys_opt_design.args.directive" -value "ExploreWithAggressiveHoldFix" -objects $obj
+}
 
 # set the current impl run
 current_run -implementation [get_runs impl_1]

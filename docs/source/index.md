@@ -8,6 +8,11 @@ Behind each MAC sits its own copy of the open-source **Zircon IP stack** from th
 transport library (FPGA Ninja). Zircon parses Ethernet/IPv4/UDP headers on receive and builds
 them on transmit, entirely in programmable logic.
 
+A second target puts **one 100 Gigabit Ethernet port on the KCU116** (Kintex UltraScale+): QSFP28
+port 0 of the card, on the XCKU5P's integrated 100G CMAC through the Taxi library's CMAC
+wrapper, with the same Zircon datapath, the same registers and the same host tests, controlled by
+a MicroBlaze. See [KCU116 target](description.md#kcu116-target) for what differs.
+
 **Full 100 Gb/s line rate from 726-byte UDP payloads up.** Below that, the header path sets
 the packet rate: about **16.7 million packets per second on transmit and 18.75 million on
 receive** per port, because Zircon's 32-bit header parser and deparser spend about 16 to 18
@@ -49,7 +54,8 @@ UART and serves them on UDP port 5002. See [Latency measurement](echo_server.md#
 
 ## Ways to test it
 
-* **Loopback cable (no host needed).** A QSFP28 cable between port 0 and port 1 of the card.
+* **Loopback cable (no host needed, VCK190).** A QSFP28 cable between port 0 and port 1 of the
+  card.
   Each port's generator sends to the other port's checker, so both ports run at the full 100 Gb/s
   line rate in both directions at the same time. The application starts this test by itself when
   it sees the two ports cabled together, and prints `LOOPBACK: PASS` when every direction has run
@@ -57,17 +63,18 @@ UART and serves them on UDP port 5002. See [Latency measurement](echo_server.md#
   through port 1's hardware UDP echo and back, which also measures the echo latency at line
   rate. See [Loopback test](testing.md#loopback-test-no-host-nic-required).
 * **Loopback plug.** A QSFP28 loopback plug in one port: that port's generator sends to its own
-  checker (console command `L <port>`).
+  checker (console command `L <port>`; `L 0` on the KCU116).
 * **Host with a 100G NIC.** Port 0 or port 1 cabled to a 100G link partner, such as a PC with a
   100G NIC. The host-side script `scripts/zircon_echo_test.py` tests the hardware echo, the
   hardware socket and the software TCP echo, and with `--latency` compares the board's latency
   figures with the host's round-trip times. See [Testing](testing.md).
 
 ```{important}
-**Status: two ports on the VCK190, bare-metal only.** This release targets the
-VCK190 with the 2x QSFP28 FMC on FMCP1, using both QSFP28 ports. There is no Linux image; the
-design is built with Vivado and Vitis only. Targets for the ZCU106 and the KCU116 are planned but
-not yet available. Those boards have no Versal MRMAC, so they need a different MAC.
+**Status: two ports on the VCK190, one port on the KCU116, bare-metal only.** The VCK190 target
+uses both QSFP28 ports of the card on FMCP1. The KCU116 target uses QSFP28 port 0 only (its HPC
+connector wires the lanes of one port), with a MicroBlaze instead of a hard processor, and boots
+from its QSPI flash or over JTAG. There is no Linux image; the design is built with Vivado and
+Vitis only.
 
 Zircon is under active development upstream. This design pins Taxi at commit `cc70b27` and
 treats Zircon as a set of tested building blocks. The logic that turns them into a working
@@ -95,13 +102,15 @@ See [Description](description.md) for an honest account of what comes from where
 
 To build the design and test it on hardware, you need:
 
-* **Vivado 2025.2, Enterprise edition.** The VCK190's XCVC1902 device is not supported by the
-  free Vivado ML Standard Edition. A 30-day evaluation license is available from AMD.
-* **The Versal MRMAC license.** It costs nothing, but you have to generate it on the AMD
-  licensing site. Without it, the device image cannot be generated.
+* **Vivado 2025.2.** For the VCK190, the **Enterprise edition**: its XCVC1902 device is not
+  supported by the free Vivado ML Standard Edition (a 30-day evaluation license is available from
+  AMD). For the KCU116, the free **Standard edition** is enough.
+* **The no-charge MAC license.** For the VCK190, the Versal MRMAC license; for the KCU116, the
+  UltraScale+ 100G CMAC license. Both cost nothing, but you have to generate them on the AMD
+  licensing site. See [Licensing](licensing.md#amd-ip-licenses).
 * **Vitis 2025.2**, for the bare-metal application. Everything builds on Windows or Linux.
-* The [2x QSFP28 FMC] (OP120) and a [VCK190] evaluation board.
-* For the **loopback test**: one QSFP28 100G cable, direct-attach copper (DAC) or active optical
+* The [2x QSFP28 FMC] (OP120) and a [VCK190] or [KCU116] evaluation board.
+* For the **loopback test** (VCK190): one QSFP28 100G cable, direct-attach copper (DAC) or active optical
   (AOC), to connect port 0 to port 1 of the card. Nothing else is needed.
 * For the **host test**: a **100G link partner that supports RS-FEC (clause 91)**, such as a 100G
   NIC or switch port, with a matching QSFP28 cable or pair of modules, and a **Linux PC with
@@ -109,7 +118,8 @@ To build the design and test it on hardware, you need:
   which ships with the repository. See [Testing](testing.md) for the details.
 
 The design itself uses **no purchased IP**. Zircon and Taxi are open source (CERN-OHL-S-2.0).
-Everything else in the block design ships with Vivado, apart from the no-cost MRMAC license. See
+Everything else in the block design ships with Vivado, apart from the no-cost MRMAC or CMAC
+license. See
 [Licensing](licensing.md) for what the CERN-OHL-S-2.0 means if you build a product from this
 design.
 
@@ -141,3 +151,4 @@ notes_bringup
 [2x QSFP28 FMC]: https://docs.opsero.com/op120/datasheet/overview/
 [Taxi]: https://github.com/fpganinja/taxi
 [VCK190]: https://www.xilinx.com/vck190
+[KCU116]: https://www.xilinx.com/kcu116

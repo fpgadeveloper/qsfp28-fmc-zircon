@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 #
-# run_xsim.sh - build and run the zircon_nic xsim testbench.
+# run_xsim.sh - build and run the zircon_nic xsim testbenches (and the KCU116 CMAC shim's).
 #
 # Copyright (c) 2026 Opsero Electronic Design Inc.
 #
@@ -133,18 +133,65 @@ xelab -L ptpu --timescale 1ns/1ps -debug typical ptpu.tb_ptp_units -s tb_ptp_uni
     > xelab_ptp.log 2>&1 || { grep -E "ERROR" xelab_ptp.log; echo "FAIL: xelab (ptp units)"; exit 1; }
 xsim tb_ptp_units -R -log xsim_ptp.log > /dev/null 2>&1 || true
 
+# ---- shim testbench: KCU116 CMAC shim (zircon_cmac_us) + zircon_nic ----
+# Taxi's taxi_eth_mac_100g_us with SIM = 1 (no GT / CMAC IP; the TB drives the GT user
+# clocks and the wrapper's CMAC client interfaces hierarchically). Sources come from the
+# Taxi .f lists (expanded here, lib/taxi symlinks resolved), compiled into library cmacu.
+echo "== xsim (zircon_cmac_us shim + zircon_nic)"
+: > xsim_cmac.log
+declare -A CMAC_SEEN=()
+CMAC_FILES=()
+cmac_add() {
+    local p; p="$(realpath "$1")"
+    [[ -n "${CMAC_SEEN[$p]:-}" ]] && return 0
+    CMAC_SEEN[$p]=1
+    CMAC_FILES+=("$p")
+}
+cmac_expand_f() {
+    local f; f="$(realpath "$1")"
+    [[ -n "${CMAC_SEEN[$f]:-}" ]] && return 0
+    CMAC_SEEN[$f]=1
+    local d line; d="$(dirname "$f")"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"; line="${line//[[:space:]]/}"
+        [[ -z "$line" ]] && continue
+        if [[ "$line" == *.f ]]; then cmac_expand_f "$d/$line"; else cmac_add "$d/$line"; fi
+    done < "$f"
+}
+# interfaces first; taxi_eth_phy_10g_usxgmii_an.sv (unused by the 100G wrapper) does not
+# compile in xsim (VRFC 10-3400), so it is left out
+cmac_add "$TAXI/axis/rtl/taxi_axis_if.sv"
+cmac_add "$TAXI/axi/rtl/taxi_axil_if.sv"
+cmac_add "$TAXI/apb/rtl/taxi_apb_if.sv"
+CMAC_SEEN[$(realpath "$TAXI/eth/rtl/taxi_eth_phy_10g_usxgmii_an.sv")]=1
+for f in "${TAXI_SV[@]}"; do cmac_add "$f"; done
+cmac_expand_f "$TAXI/eth/rtl/us/taxi_eth_mac_100g_us.f"
+cmac_add "$TAXI/axi/rtl/taxi_axil_apb_adapter.sv"
+for f in "${GLUE_SV[@]}"; do cmac_add "$f"; done
+cmac_add "$HDL_DIR/ts_gray_sync.sv"
+cmac_add "$HDL_DIR/zircon_cmac_us_core.sv"
+xvlog --relax -work cmacu -sv "${CMAC_FILES[@]}" "$TB_DIR/tb_zircon_cmac_us.sv" > xvlog_cmac.log 2>&1 \
+    || { grep -E "ERROR" xvlog_cmac.log; echo "FAIL: xvlog (cmac shim)"; exit 1; }
+xvlog -work cmacu "$HDL_DIR/zircon_nic.v" "$HDL_DIR/zircon_cmac_us.v" >> xvlog_cmac.log 2>&1 \
+    || { grep -E "ERROR" xvlog_cmac.log; echo "FAIL: xvlog (cmac shim)"; exit 1; }
+xelab -L cmacu --relax --timescale 1ns/1ps -debug typical cmacu.tb_zircon_cmac_us -s tb_zircon_cmac_us \
+    > xelab_cmac.log 2>&1 || { grep -E "ERROR" xelab_cmac.log; echo "FAIL: xelab (cmac shim)"; exit 1; }
+xsim tb_zircon_cmac_us -R -log xsim_cmac.log > /dev/null 2>&1 || true
+
 sed -i 's/^PASS: test /PASS: test gen0 /; s/^FAIL: test /FAIL: test gen0 /' xsim_gen0.log
 grep -hE "^(PASS|FAIL):|ERROR|subsequence check|count check|prefix check|lossy phase|RATE |  rate_|  rx_100G|  0x" \
-    xsim.log xsim_gen0.log xsim_rxpath.log xsim_ptp.log || true
+    xsim.log xsim_gen0.log xsim_rxpath.log xsim_ptp.log xsim_cmac.log || true
 grep -hE "^  (LAT bank|PTP records|coherence|after_mac|  mode 1|[0-9]+ frames, )" xsim.log xsim_ptp.log || true
-n_pass=$(cat xsim.log xsim_gen0.log xsim_rxpath.log xsim_ptp.log | grep -c "^PASS:" || true)
-n_fail=$(cat xsim.log xsim_gen0.log xsim_rxpath.log xsim_ptp.log | grep -c "^FAIL:" || true)
+grep -hE "^  (TX_CLK_KHZ|RX_CLK_KHZ|RX event lag|TX event lag|loop delta|gen->chk|echo latency|ts_gray_sync)" xsim_cmac.log || true
+n_pass=$(cat xsim.log xsim_gen0.log xsim_rxpath.log xsim_ptp.log xsim_cmac.log | grep -c "^PASS:" || true)
+n_fail=$(cat xsim.log xsim_gen0.log xsim_rxpath.log xsim_ptp.log xsim_cmac.log | grep -c "^FAIL:" || true)
 echo "SUMMARY: $n_pass passed, $n_fail failed"
 if grep -q "^ALL TESTS PASSED" xsim.log && grep -q "^ALL TESTS PASSED" xsim_gen0.log && \
-   grep -q "^ALL TESTS PASSED" xsim_rxpath.log && grep -q "^ALL TESTS PASSED" xsim_ptp.log && [[ "$n_fail" == 0 ]]; then
+   grep -q "^ALL TESTS PASSED" xsim_rxpath.log && grep -q "^ALL TESTS PASSED" xsim_ptp.log && \
+   grep -q "^ALL TESTS PASSED" xsim_cmac.log && [[ "$n_fail" == 0 ]]; then
     echo "ALL TESTS PASSED"
     exit 0
 fi
 echo "TESTS FAILED"
-echo "xsim logs: $BUILD/xsim.log $BUILD/xsim_gen0.log $BUILD/xsim_rxpath.log $BUILD/xsim_ptp.log"
+echo "xsim logs: $BUILD/xsim.log $BUILD/xsim_gen0.log $BUILD/xsim_rxpath.log $BUILD/xsim_ptp.log $BUILD/xsim_cmac.log"
 exit 1

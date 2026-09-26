@@ -3,6 +3,10 @@
  * console.c - buffered, non-blocking UART console output (see console.h)
  *
  * Copyright (c) 2026 Opsero Electronic Design Inc.
+ *
+ * UART backends, picked from the BSP's STDOUT: the Versal PS UART (PL011,
+ * xuartpsv), or on MicroBlaze targets an AXI UART Lite (xuartlite). Anything
+ * else falls back to the BSP's blocking outbyte() and has no input.
  */
 #include <stdarg.h>
 #include <stdio.h>
@@ -19,6 +23,14 @@
 #define CON_UARTPSV 0
 #endif
 
+#if !CON_UARTPSV && defined(__MICROBLAZE__) && defined(STDOUT_BASEADDRESS) && \
+    __has_include("xuartlite_l.h")
+#include "xuartlite_l.h"
+#define CON_UARTLITE 1
+#else
+#define CON_UARTLITE 0
+#endif
+
 static char ring[CON_RING_SIZE];
 static u32 head, tail;          /* head: next write, tail: next read (free-running) */
 static int async_on;
@@ -29,6 +41,8 @@ static int tx_full(void)
 {
 #if CON_UARTPSV
 	return XUartPsv_IsTransmitFull(STDOUT_BASEADDRESS);
+#elif CON_UARTLITE
+	return XUartLite_IsTransmitFull(STDOUT_BASEADDRESS);
 #else
 	return 0;
 #endif
@@ -38,6 +52,9 @@ static void tx_byte(char c)
 {
 #if CON_UARTPSV
 	Xil_Out32(STDOUT_BASEADDRESS + XUARTPSV_UARTDR_OFFSET, (u32)(u8)c);
+#elif CON_UARTLITE
+	/* tx_full() said there is room: write the FIFO without waiting */
+	XUartLite_WriteReg(STDOUT_BASEADDRESS, XUL_TX_FIFO_OFFSET, (u32)(u8)c);
 #else
 	outbyte(c);
 #endif
@@ -95,6 +112,10 @@ int con_getc(void)
 	if (!XUartPsv_IsReceiveData(STDIN_BASEADDRESS))
 		return -1;
 	return (int)(XUartPsv_ReadReg(STDIN_BASEADDRESS, XUARTPSV_UARTDR_OFFSET) & 0xFF);
+#elif CON_UARTLITE && defined(STDIN_BASEADDRESS)
+	if (XUartLite_IsReceiveEmpty(STDIN_BASEADDRESS))
+		return -1;
+	return (int)(XUartLite_ReadReg(STDIN_BASEADDRESS, XUL_RX_FIFO_OFFSET) & 0xFF);
 #else
 	return -1;
 #endif

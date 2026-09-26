@@ -7,7 +7,10 @@
  * What the hardware measures (docs/source/echo_server.md "Latency
  * measurement", DESIGN_SPEC section 11): the MRMAC timestamps the first PCS
  * block of every frame on RX and of the selected frames on TX against one
- * free-running 1588 systimer (2^-8 ns units). zircon_nic subtracts the two
+ * free-running 1588 systimer (2^-8 ns units). On the CMAC targets (kcu116,
+ * HW_MAC_CMAC) the zircon_cmac_us shim takes the same-format timestamps
+ * itself at the MAC-client interface (first beat of the frame RX / TX), so
+ * the constant CMAC pipeline is excluded there. zircon_nic subtracts the two
  * and accumulates the delta, in ns, into one of two statistics banks:
  *
  *   bank 0  every hardware UDP echo reply: RX of the request -> TX of the reply
@@ -25,7 +28,6 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "xiltimer.h"
 #include "sleep.h"
 
 #include "lwip/udp.h"
@@ -37,9 +39,13 @@
 #include "port.h"
 #include "latency.h"
 #include "latency_wire.h"
+#include "timebase.h"
 
-#ifndef COUNTS_PER_SECOND
-#define COUNTS_PER_SECOND XPAR_CPU_TIMESTAMP_CLK_FREQ
+/* The window the hardware measures, for the console report */
+#if defined(HW_MAC_CMAC)
+#define LAT_WINDOW "MAC-client SOF RX -> TX, zircon_cmac_us timestamps"
+#else
+#define LAT_WINDOW "RX PCS -> TX PCS of the MRMAC"
 #endif
 
 static const char *const bank_name[ZIRCON_LAT_NBANKS] = {
@@ -148,6 +154,32 @@ static int snapshot(port_t *p)
 /* ------------------------------------------------------------------------ */
 /* Bring-up                                                                   */
 /* ------------------------------------------------------------------------ */
+#if defined(HW_MAC_CMAC)
+/* The shim's timestamp timer (45-bit ts_clk tick count << 10, the same
+ * 2^-8 ns units as the MRMAC's) read twice, 10 ms of CPU time apart through
+ * TS_NOW: the "1588 timer advances" check of the Versal design. */
+void lat_print_1588(port_t *p)
+{
+	u64 a, b, t0, t1, dts, dt_ns;
+
+	a = mac_ts_now(&p->hw);
+	t0 = tb_now();
+	usleep(10000);
+	b = mac_ts_now(&p->hw);
+	t1 = tb_now();
+	dts = ((b - a) & ZIRCON_TS_MASK) >> ZIRCON_TS_FRAC_BITS;
+	dt_ns = (t1 - t0) * 1000000000ULL / TB_HZ;
+	con_printf("Port %d: shim timestamp timer %llu.%09llu s, advanced %llu ns in %llu ns of CPU time"
+		   " (TS_INCR %lu); latency = MAC-client SOF RX -> TX\r\n", p->n,
+		   (unsigned long long)((b >> 8) / 1000000000ULL),
+		   (unsigned long long)((b >> 8) % 1000000000ULL),
+		   (unsigned long long)dts, (unsigned long long)dt_ns,
+		   (unsigned long)mac_ts_incr(&p->hw));
+	if (dts == 0)
+		con_printf("Port %d: WARNING: the shim timestamp timer does not advance: latency "
+			   "timestamps will be wrong\r\n", p->n);
+}
+#else
 /* Read the MRMAC 1588 registers twice, 10 ms of A72 time apart; returns the
  * time (ns) the TX / RX timers advanced. TICK_REG also latches the MRMAC
  * statistics: harmless at bring-up (nothing has been counted yet), never done
@@ -161,18 +193,18 @@ static int snapshot(port_t *p)
 static u64 systimer_probe(port_t *p, mrmac_1588_t *b, u64 *dtx, u64 *drx)
 {
 	mrmac_1588_t a;
-	XTime t0, t1;
+	u64 t0, t1;
 
-	mrmac_tick_only(p->hw.mrmac);
-	mrmac_1588_read(p->hw.mrmac, &a);
-	XTime_GetTime(&t0);
+	mrmac_tick_only(p->hw.mac);
+	mrmac_1588_read(p->hw.mac, &a);
+	t0 = tb_now();
 	usleep(10000);
-	mrmac_tick_only(p->hw.mrmac);
-	mrmac_1588_read(p->hw.mrmac, b);
-	XTime_GetTime(&t1);
+	mrmac_tick_only(p->hw.mac);
+	mrmac_1588_read(p->hw.mac, b);
+	t1 = tb_now();
 	*dtx = ((b->tx_sample - a.tx_sample) & ZIRCON_TS_MASK) >> ZIRCON_TS_FRAC_BITS;
 	*drx = ((b->rx_sample - a.rx_sample) & ZIRCON_TS_MASK) >> ZIRCON_TS_FRAC_BITS;
-	return (u64)(t1 - t0) * 1000000000ULL / COUNTS_PER_SECOND;
+	return (u64)(t1 - t0) * 1000000000ULL / TB_HZ;
 }
 
 void lat_print_1588(port_t *p)
@@ -199,6 +231,7 @@ void lat_print_1588(port_t *p)
 		con_printf("Port %d: WARNING: the MRMAC 1588 timer does not advance: latency "
 			   "timestamps will be wrong\r\n", p->n);
 }
+#endif /* HW_MAC_CMAC */
 
 void lat_port_init(port_t *p)
 {
@@ -284,10 +317,10 @@ static void report_port(port_t *p)
 	zircon_lat_read_err(&p->zircon, &e);
 	bin_geom(p, &b[0], &g);
 	con_printf("LATENCY port %d (LAT_CTRL 0x%08lx LAT_STATUS 0x%08lx%s, stale %lu lost %lu ovf %lu,"
-		   " bins %lu ns from %lu ns; RX PCS -> TX PCS of the MRMAC)\r\n", p->n,
+		   " bins %lu ns from %lu ns; " LAT_WINDOW ")\r\n", p->n,
 		   (unsigned long)zircon_lat_get_ctrl(&p->zircon),
 		   (unsigned long)zircon_lat_status(&p->zircon),
-		   (mrmac_gt_gpio_in(p->hw.gpio_gt) & MRMAC_GT_IN_PTP_UNDERRUN) ? " PTP_UNDERRUN" : "",
+		   mac_ptp_underrun(&p->hw) ? " PTP_UNDERRUN" : "",
 		   (unsigned long)e.stale, (unsigned long)e.lost, (unsigned long)e.ovf,
 		   (unsigned long)g.width, (unsigned long)g.base);
 	for (bank = 0; bank < ZIRCON_LAT_NBANKS; bank++) {

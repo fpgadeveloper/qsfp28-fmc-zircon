@@ -2,9 +2,11 @@
 
 This page describes how to test the design. There are two ways:
 
-* **Loopback test (no host NIC required):** a QSFP28 cable between port 0 and port 1 of the FMC,
-  and the hardware UDP generators and checkers of both ports run 2 × 100 Gb/s at full line rate.
-  See [Loopback test](#loopback-test-no-host-nic-required).
+* **Loopback test (no host NIC required, VCK190):** a QSFP28 cable between port 0 and port 1 of
+  the FMC, and the hardware UDP generators and checkers of both ports run 2 × 100 Gb/s at full
+  line rate. See [Loopback test](#loopback-test-no-host-nic-required). The KCU116 has one port,
+  so it is tested with a host or with a QSFP28 loopback plug in port 0 (`L 0` runs 100 Gb/s
+  line rate through the plug; see [KCU116](#kcu116-port-0-microblaze-v130)).
 * **Host test:** port 0 or port 1 cabled to a 100G link partner, and the host-side script checks
   the hardware echo, the hardware socket and the software TCP echo. The rest of this page
   describes what the partner needs, how to load the board, how to run the host-side test script,
@@ -40,9 +42,9 @@ sudo ethtool --set-fec <if> encoding auto     # or: encoding rs
 ethtool --show-fec <if>
 ```
 
-The bare-metal echo server can also switch its own FEC mode (it tries FEC off every 10 seconds
-while the link is down, and the `f` key cycles the modes); see
-[FEC mode](echo_server.md#fec-mode).
+The bare-metal echo server keeps RS-FEC while it waits for a link (there is no automatic
+fallback by default). On the VCK190 the `f` key cycles the FEC modes by hand; on the KCU116 the
+FEC is fixed at RS(528,514). See [FEC mode](echo_server.md#fec-mode).
 
 ## Host setup
 
@@ -60,7 +62,10 @@ For the jumbo-frame tests, the host interface also needs an MTU of 9000
 Build the boot image with `./build.sh standalone --target vck190_fmcp1` (see
 [Build instructions](build_instructions.md)) and load `Vitis/boot/vck190_fmcp1/BOOT.BIN`
 either from a FAT32 microSD card or over JTAG, as described in
-[Run the application](echo_server.md#run-the-application). Open the UART console (115200 baud)
+[Run the application](echo_server.md#run-the-application). On the KCU116, build with
+`./build.sh all --target kcu116` and load `Vitis/boot/kcu116/zircon_boot.bit` over JTAG, or boot
+from the QSPI flash (see
+[KCU116: bitstream and QSPI flash](build_instructions.md#kcu116-bitstream-and-qspi-flash)). Open the UART console (115200 baud)
 and wait for the `Port <n>: IP …` line of the port you cabled: it gives that port's address for
 the tests below.
 
@@ -242,7 +247,9 @@ definition in [registers.md](registers.md) (sequence number + xorshift lanes).
 
 With zircon_nic 1.3.0 the board measures the latency of its echoes itself, from the MRMAC's
 1588 timestamps: RX PCS of the request to TX PCS of the reply, for the hardware UDP echo (bank 0)
-and the software TCP echo (bank 1). What is and is not included, the `T` console command and the
+and the software TCP echo (bank 1). On the KCU116 the timestamps come from the CMAC shim, at the
+CMAC's client interface, so its figures are lower and not directly comparable (see
+[KCU116 timestamps](design.md#timestamps-on-the-kcu116)); the test procedure is the same. What is and is not included, the `T` console command and the
 UDP 5002 statistics service are described in
 [Latency measurement](echo_server.md#latency-measurement). The host script puts the board's
 numbers next to its own round-trip times:
@@ -697,6 +704,236 @@ preamble/IPG overhead, payload rate is UDP payload only.
 * **Same-subnet routing.** With port 1 on 192.168.21.2 (the same subnet as port 0's DHCP lease),
   TCP to port 0 at first timed out: lwIP sent the SYN-ACK out of port 1. The source-routing
   hook fixed it, and `zircon_echo_test.py --port 0` then passed in full.
+
+### KCU116 (port 0, MicroBlaze, v1.3.0)
+
+First bring-up of the `kcu116` target, 2026-09-25 (journal `logs/_bench/kcu116_journal.log`,
+17:02–17:22). The OP120 is on the KCU116's HPC slot, where only QSFP port 0 is wired. Port 0 is
+cabled to the host's Intel E810-C (`ens6f1np1`, FEC auto, MTU 1500, DHCP from the
+NetworkManager shared profile). The loopback-plug runs (`L 0`, `e`, jumbo frames) came later
+the same day; see [Loopback plug](#loopback-plug-port-0-2026-09-25-19401954).
+
+**JTAG load** (`bench.py program kcu116 --arch microblaze --bit zircon_wrapper.bit --elf
+echo_server.elf --expect 'Port 0: IP'`, application started 17:03:11). It worked on the first
+load with no software changes:
+
+```
+Si5328 programmed: GT refclk 322.265625 MHz (CKOUT1 port 0)
+zircon_nic 1.3.0 at 0x440a0000 (port 0)
+Port 0: CMAC at 0x44000000 configured: ... FEC RS(528,514) (fixed), CTRL 0x30 STATUS 0xf0, tx_clk 273037 kHz rx_clk 171602 kHz
+Port 0: shim timestamp timer 4.969808696 s, advanced 10003240 ns in 10003240 ns of CPU time (TS_INCR 1024)
+Waiting for the 100G link...
+Port 0: link down: FEC RS(528,514), CMAC STATUS 0xf0 (block lock 0, RX in reset), sticky 0x0, tx_clk 322270 kHz rx_clk 286545 kHz
+Port 0: link up, 100 Gb/s, FEC RS(528,514)
+Port 0: IP 192.168.21.162 mask 255.255.255.0 gw 192.168.21.1 (DHCP)
+```
+
+* The clock readings on the `configured` line come from a 1 ms window that overlaps the
+  release of `CTRL.XCVR_RST`, so they are partial. The next reading was `tx_clk` 322,270 kHz
+  (322.265625 MHz expected).
+* The host reported 100000 Mb/s with active FEC encoding RS. The link stayed up for the whole
+  session.
+* The Taxi CMAC wrapper has no RS-FEC codeword counters, so the status line prints `cw corr
+  n/a uncorr n/a`.
+
+**`zircon_echo_test.py --from-log ... --ping`: `VERDICT: PASS`.**
+
+* ping: 3/3, RTT 0.130 ms average.
+* UDP hardware echo: sweep 1..1472 B, all intact.
+* UDP burst: 20,000/20,000 datagrams of 1472 B at 102,716 datagrams/s with 64 in flight, which
+  is the host's limit.
+* TCP software echo: 100/100 exchanges, 18.8 Mb/s. This is slower than on the VCK190 because of
+  the 100 MHz MicroBlaze.
+* Socket demo: 55/55.
+* Host checksum error counters: +0.
+* Jumbo frames were not tested against the host because its MTU is 1500 and changing it needs
+  root. They were verified later on the loopback plug (9000-byte payloads, see below).
+
+**Latency** (`--latency --lat-sizes 64` and `--lat-sizes 1472`, 1000 exchanges each, one request
+in flight). The board columns come from the shim's fabric timestamps, taken at MAC-client SOF on
+RX and on TX. That excludes the CMAC TX+RX pipeline, so they are **not comparable** with the
+VCK190's PCS-to-PCS numbers (see [KCU116 timestamps](design.md#timestamps-on-the-kcu116)). The
+timestamps are quantised to 4 ns (the 250 MHz `ts_clk`). Board figures below are from `T 0`:
+
+| payload | host RTT UDP mean / p50 / p99 | board HW UDP echo min / mean / max, stddev | host RTT TCP mean / p50 / p99 | board SW TCP echo min / mean / max, stddev |
+|---|---|---|---|---|
+| 64 B | 29.2 / 28.7 / 38.8 µs | 380 / 385.2 / 392 ns, 2.3 ns | 131.6 / 126.8 / 164.3 µs | 86.3 / 93.1 / 117.2 µs, 3.8 µs |
+| 1472 B (TCP 1460 B) | 30.3 / 29.5 / 39.6 µs | 712 / 717.8 / 732 ns, 2.8 ns | 650.5 / 654.5 / 743.1 µs | 484.6 / 501.4 / 555.4 µs, 13.6 µs |
+
+Bank 1 counted exactly one sample per TCP exchange. The software echo takes about 0.5 ms for a
+1460 B segment on the MicroBlaze, against 9.7 µs on the VCK190's A72.
+
+**Hardware echo soak.** The test ran from 17:06:01 to 17:07:24, after `c` and `T 0 c`: 12,000,000
+× 1472 B datagrams with 64 in flight, at 143,759 datagrams/s and 1.69 Gb/s of payload each way
+(host-limited). The result was `VERDICT: PASS`: 0 lost, 0 corrupt, host checksum counters +0.
+
+* zircon_nic: RX = TX = 12,000,003 frames, echo 12,000,001. `bad`, `fifo drop`, L3/L4 checksum,
+  all drop counters, `tx oversize` and `STATUS` were all 0.
+* CMAC: rx 12,000,003 good, 0 bad FCS, 0 error frames. tx 12,000,003 good, with 12,000,001 TX
+  timestamps returned.
+* Latency bank 0 held 12,000,001 samples: min 712, mean 718.1, max 740 ns, stddev 2.8 ns, all in
+  the 704–768 ns bin. `LAT_STATUS` 0, and 0 stale, 0 lost, 0 overflowed.
+
+**Generator and checker against the host.** The console has no register-write command, so
+the registers were written over JTAG with xsdb (MicroBlaze stopped for a moment, then `con`).
+
+* Checker (`CHK_CTRL` = 4, then 1; then `zircon_prbs_tool.py send 192.168.21.162 --count 10000
+  --len 1000`): `CHK_RX_PKTS` = 10,000, 0 sequence, bit or length errors.
+* Generator toward the host (to 192.168.21.1:6000, 1000 × 1000 B, `GEN_GAP` 3000):
+  `zircon_prbs_tool.py listen` got 1000/1000 datagrams with sequence numbers 0..999
+  contiguous, 0 payload bit errors, and `VERDICT: PASS`. `GEN_SRC_PORT` was left at 0 in this
+  run.
+
+**QSPI boot.** `Vitis/boot/kcu116/zircon_boot.mcs` was programmed with Vivado hw_manager
+(`program_hw_cfgmem`, erase + program + verify: OK, 17:11–17:16).
+
+* The KCU116's configuration flash identifies as a **Micron MT25QU01G** (1 Gb, JEDEC 20 BB 21).
+  Vivado rejects the `mt25qu256` part, so use `mt25qu01g-spi-x1_x2_x4`. The bitstream takes
+  about 12 MB of the 128 MB flash. (This run programmed an `.mcs` written for a 32 MB flash; the
+  build now writes it for 128 MB, `flashsize` in `config/data.json`.)
+* The mode pins read M[2:0] = 001 (master SPI) with the board as delivered.
+* After `bench.py power kcu116 cycle` (plug on 17:16:30), with no JTAG, the board configured
+  from flash and ran the application. `Port 0: link up, 100 Gb/s, FEC RS(528,514)` appeared,
+  then `Port 0: IP 192.168.21.162 ... (DHCP)` at 17:16:38, about 8 s after power-on (3 s of
+  application time).
+* The application zeroes its `.bss` in DDR4 at start-up, and it ran cleanly with no reset
+  after DDR calibration was needed.
+* `zircon_echo_test.py` then gave `VERDICT: PASS` again (UDP sweep and burst, TCP, socket,
+  checksums).
+
+#### Loopback plug (port 0, 2026-09-25 19:40–19:54)
+
+The host cable was replaced by a passive QSFP28 loopback plug in port 0, with the QSPI-booted
+v1.3.0 application (journal `logs/_bench/kcu116_journal.log`, session from 19:40:11).
+
+**Link over the plug.** After `bench.py power kcu116 cycle` (plug on at 19:40:24) the link came
+up on the first power-on, with no retry and no intermediate `link down` line:
+
+```
+Port 0: CMAC at 0x44000000 configured: 100GE CAUI-4 (Taxi taxi_eth_mac_100g_us, shim 1.0), FEC RS(528,514) (fixed), CTRL 0x30 STATUS 0xf0, tx_clk 322270 kHz rx_clk 108454 kHz
+Waiting for the 100G link...
+Port 0: link up, 100 Gb/s, FEC RS(528,514)
+Port 0: DHCP started
+```
+
+No DHCP server answers on a plug, so port 0 fell back to its static address 192.168.20.2 after
+10 s (lwIP's own 4 DHCP discovers came back through the plug: `rx 4 raw 4`). The link stayed up
+for the whole session. The one-port build has no automatic loopback start; every test below was
+started from the console.
+
+**Self-loop `L 0`: throughput vs payload** (19:41:36–19:43:29). `p 64`, then `L 0`, then `p <bytes>`
+for each further size (which restarts the test with fresh counters), 16 s per size. Packets per
+second is the mean increase of `gen TX pkts` over the nine 1-second intervals from 6 s to 15 s;
+the spread was at most ±122 packets/s (the MicroBlaze prints the table less regularly than the
+A72). The checker rose by the same amount. The rate columns had the same value in every table
+from 6 s on. The totals are from the summary line printed when each size's run was stopped.
+
+| UDP payload | Frame (with FCS) | Line rate TX = RX | UDP payload rate | Packets/s | seq / bit / len errors | gen TX / chk RX at stop | Verdict |
+|---|---|---|---|---|---|---|---|
+| 64 B | 110 B | 17.33 Gb/s | 8.53 Gb/s | 16,666,658 | 0 / 0 / 0 | 268,892,613 / 268,892,613 | FAIL rate (packet-rate limit, as expected) |
+| 256 B | 302 B | 42.93 Gb/s | 34.13 Gb/s | 16,666,661 | 0 / 0 / 0 | 268,848,842 / 268,848,842 | FAIL rate (as expected) |
+| 512 B | 558 B | 77.06 Gb/s | 68.26 Gb/s | 16,666,661 | 0 / 0 / 0 | 268,838,799 / 268,838,799 | FAIL rate (as expected) |
+| 726 B | 772 B | 100.00 Gb/s | 91.66 Gb/s | 15,783,067 | 0 / 0 / 0 | 254,589,833 / 254,589,833 | PASS |
+| 1024 B | 1070 B | 100.00 Gb/s | 93.94 Gb/s | 11,468,070 | 0 / 0 / 0 | 184,974,080 / 184,974,080 | PASS |
+| 1472 B | 1518 B | 100.00 Gb/s | 95.71 Gb/s | 8,127,557 | 0 / 0 / 0 | 131,116,293 / 131,116,293 | PASS |
+| 9000 B (jumbo) | 9046 B | 100.00 Gb/s | 99.27 Gb/s | 1,378,799 | 0 / 0 / 0 | 22,237,117 / 22,237,117 | PASS |
+
+* **The shape is the VCK190's**: the same line and payload rates at every size (95.71 against
+  95.70 Gb/s at 1472 B is the last digit of the rounding), the full 100 Gb/s from 726 bytes up,
+  and 16.67 Mpps below that (300 MHz / 18 cycles; the TX header path of the KCU116's core
+  runs at 300 MHz too). 128 B and 1500 B were not run.
+* **The packet rates read about 15 ppm above the theoretical 100GBASE-R rates** at 726 B and up
+  (for example 8,127,557 against 8,127,438 at 1472 B), while the 64–512 B rates are within
+  0.5 ppm of 300 MHz / 18. The application times its 1-second table with a clock that runs with
+  the core clock; the line rate comes from the Si5328 reference clock of the GT. The 15 ppm is
+  therefore the offset between the two oscillators (within Ethernet's ±100 ppm), not a
+  difference in the datapath.
+* After the sweep, zircon_nic's `RX_FRAMES` = `TX_FRAMES` = 1,399,497,581, every drop counter and
+  `STATUS` 0; the CMAC counted 0 bad FCS.
+
+**Echo through the plug, `e`** (19:43:56–19:46:37, 31 s per size, `T c` before and `T 0` after each
+run). On a one-port build the generator addresses port 0's own MAC/IP and UDP port 7: request →
+plug → port 0's hardware echo → reply → plug → port 0's checker. Requests and replies share
+port 0's transmit path, which serves the generator and the echo round robin per packet, so each
+stream gets half of the line and the checked datagram rate is half of the self-loop rate. The
+rate columns count all frames (requests + replies).
+
+| payload | line / payload rate (all frames) | datagrams/s checked | gen TX / chk RX at stop | seq / bit / len errors | `RX_ECHO_DROP` | verdict |
+|---|---|---|---|---|---|---|
+| 64 B | 17.33 / 8.53 Gb/s | 8,331,416 (generator 8,335,247) | 259,751,123 / 259,631,513 | 119,425 / 0 / 0 | 119,610 | FAIL rate (expected: packet-rate limit; see below) |
+| 726 B | 100.00 / 91.66 Gb/s | 7,891,545 | 246,057,344 / 246,057,344 | 0 / 0 / 0 | 0 | PASS |
+| 1472 B | 100.00 / 95.71 Gb/s | 4,063,787 | 126,683,970 / 126,683,970 | 0 / 0 / 0 | 0 | PASS |
+| 9000 B | 100.00 / 99.27 Gb/s | 689,400 | 21,483,850 / 21,483,850 | 0 / 0 / 0 | 0 | PASS |
+
+* **At 64 B the transmit header path is oversubscribed**: requests and replies together need
+  more than its 16.67 Mpps, the generator does not wait for the echo, and the echo dropped
+  119,610 requests for lack of transmit room (0.046 %). That is exactly the difference between
+  the generated and the checked datagrams (the 119,425 sequence errors count the gaps, and
+  some gaps held more than one datagram). The echo path itself was not at fault: there were
+  0 bit and length errors. A two-port setup (VCK190 `e`) has a separate transmit path for the
+  echo and does not show this. From 726 B up nothing was dropped.
+* `T 0` showed `LAT_STATUS` 0 and stale / lost / overflow 0 after every run, and 0 implausible
+  samples. Bank 1 stayed empty.
+
+**Latency.** Under the `e` load the echo reply waits behind the generator in the shared transmit
+path, so bank 0 measures the depth of that queue, not the path:
+
+| payload | samples | min | mean | max | stddev | bins |
+|---|---|---|---|---|---|---|
+| 64 B (`e`, 31 s) | 259,631,513 | 6468 | 31,252.0 | 43,964 | 23.8 | 6144-12288: 11; 12288-24576: 175; 24576-49152: 259,631,327 |
+| 726 B (`e`, 31 s) | 246,057,344 | 940 | 5909.0 | 5936 | 4.7 | 49 samples in 896–3072 (the queue filling at the start); 3072-6144: 246,057,295 |
+| 1472 B (`e`, 31 s) | 126,683,970 | 1236 | 7510.8 | 7540 | 5.9 | 66 samples in 1216–6144; 6144-12288: 126,683,904 |
+| 9000 B (`e`, 31 s) | 21,483,850 | 4580 | 8943.5 | 8972 | 6.6 | 3072-6144: 6; 6144-12288: 21,483,844 |
+
+All values in ns (bins above 3072 ns are wider, as printed by `T`). To measure the path itself,
+the generator was paced over JTAG (19:47:35–19:48:24; xsdb with the MicroBlaze stopped for a
+moment, as for the host tests above): `GEN_DST` = port 0's own MAC / 192.168.20.2 port 7,
+`GEN_SRC_PORT` 5001, `GEN_COUNT` 1000, `GEN_GAP` 300,000 cycles (1 ms), checker on 5001.
+Each run checked 1000 / 1000 datagrams with 0 sequence, bit or length errors:
+
+| payload (frame) | samples | min | mean | max | stddev | bins (64 ns wide) |
+|---|---|---|---|---|---|---|
+| 64 B (110 B) | 1000 | 384 | 384.8 | 388 | 1.6 | 384-448: all |
+| 726 B (772 B) | 1000 | 540 | 545.7 | 552 | 2.8 | 512-576: all |
+| 1472 B (1518 B) | 1000 | 716 | 720.1 | 736 | 2.5 | 704-768: all |
+| 9000 B (9046 B) | 1000 | 2876 | 2881.5 | 2896 | 2.4 | 2816-2880: 45; 2880-2944: 955 |
+
+All values in ns, MAC-client SOF RX → TX (shim timestamps, 4 ns quantisation; not comparable
+with the VCK190's PCS-to-PCS figures). The 64 B and 1472 B means match the host-cable figures
+above (385.2 and 717.8 ns) to within 2.3 ns, and the slope from 1472 B to 9000 B is 0.29 ns per
+byte, as on the VCK190.
+
+**5-minute soak, `e` at 1472 B** (`p 1472`, `c`, `T c`, then `e` at 19:48:43, stopped with `e`
+at 19:53:45 after 302 s):
+
+* `LOOPBACK-ECHO: PASS` at 11 s, no `FAIL` and no link-down line. Every table from 2 s on read
+  100.00 Gb/s line, 95.71 Gb/s payload, both ways.
+* Generator / checker: 1,228,045,072 / 1,228,045,072 datagrams (1.81 TB of payload checked bit
+  by bit), 0 sequence, bit or length errors.
+* CMAC: RX 2,456,090,144 frames, all good, 0 bad FCS, 0 error frames; TX 2,456,090,144 good,
+  1,228,045,072 TX timestamps returned (one per echo). The target has no RS-FEC counters.
+* zircon_nic: `RX_FRAMES` = `TX_FRAMES` = 2,456,090,144, `RX_ECHO` = `TX_ECHO` = 1,228,045,072.
+  `RX_BAD_FRAME`, `RX_FIFO_DROP`, the L3/L4 checksum counters, `RX_RAW_DROP`, `RX_SOCK_DROP`,
+  `RX_ECHO_DROP`, `TX_OVERSIZE_DROP` and `STATUS` all 0; `LAT_STATUS` 0, stale / lost / overflow 0.
+* Latency bank 0: 1,228,045,072 samples, min 1220, mean 7510.8, max 7540 ns, stddev 5.3 ns
+  (66 start-up samples below 6144 ns, the rest in 6144–12288 ns; queueing, as above).
+
+```
+LOOPBACK-ECHO: RUNNING 302 s (echo-through-loopback, 1472 B payload)
+port link FEC            gen TX pkts    chk RX pkts  seq err       bit err  len err  TX Gb/s  RX Gb/s  TX pay.  RX pay.
+P0   up   RS(528,514)     1227260039     1227259986        0             0        0   100.00   100.00    95.71    95.71
+Port 0: gen/chk 1228045072/1228045072 pkts, 0 seq err, 0 bit err, RX 100.00 Gb/s (TX 100.00 Gb/s, 0 len err)
+LOOPBACK-ECHO: stopped after 302 s (console)
+          P0 CMAC rx pkts 2456090144 good 2456090144 bad FCS 0 err 0 | tx pkts 2456090144 good 2456090144 timestamps 1228045072
+```
+
+**Jumbo frames: verified.** 9000-byte payloads (9046-byte frames with FCS) pass end to end
+through the CMAC in both directions: `L 0` at 100.00 Gb/s with 22,237,117 datagrams and no
+errors, `e` with 21,483,850 requests and replies and no errors or drops, and 1000 paced echoes.
+The CMAC's static maximum frame length is therefore at least 9046 bytes, enough for the
+9000-byte payloads the generator can make. The exact limit (believed 9600) was not probed.
+
+The board was left powered, running the QSPI-booted application with no test running.
 
 ### History (1.2.0)
 

@@ -33,11 +33,20 @@
 #   },
 #   "vivado_postfix": "",          # optional: appended to Vivado project dir name
 #   "linker_script_mods": {        # optional: per-arch linker script modifications
-#     "microblaze": "relocate_to_local_mem",
+#     "microblaze": "relocate_to_local_mem",   # or "relocate_to_ddr" / "code_local_bss_ddr"
 #     "zynq": "relocate_to_ddr"
 #   },
+#   "compile_optimization": {      # optional: per-arch app optimisation level (the
+#     "microblaze": "-O2"          #   app component's USER_COMPILE_OPTIMIZATION_LEVEL,
+#   },                             #   default -O0); a plain string = every arch
+#   "gc_sections": {               # optional: per-arch linker garbage collection
+#     "microblaze": true           #   (-ffunction/-fdata-sections + --gc-sections),
+#   },                             #   e.g. to fit a local-memory image
 #   "stack_size": "0x10000",         # optional: override default stack size in linker script
 #   "heap_size": "0x10000",          # optional: override default heap size in linker script
+#                                    #   either a plain string (all architectures) or a
+#                                    #   per-arch map, e.g. {"microblaze": "0x8000"} --
+#                                    #   an arch that is not listed keeps the tool default
 #   "combine_bit_elf": true,       # ignored here; used by make-boot.py later
 #
 #   # ---- optional: User DTS for the platform (see "User DTS" below) ---------
@@ -146,7 +155,7 @@ def copy_src_entry(entry, cwd, dst_dir):
         return total
     return _copy_single_src_entry(entry, cwd, dst_dir)
 
-def setup_embeddedsw(repo_root, workspace):
+def setup_embeddedsw(repo_root, workspace, arch=None):
     """Set up a local embeddedsw repo in the workspace from patched driver files.
 
     If <repo_root>/EmbeddedSw/ exists, creates <workspace>/embeddedsw/ containing:
@@ -154,10 +163,22 @@ def setup_embeddedsw(repo_root, workspace):
       2. The full 'src' and 'data' directories from the Vitis install for each
          driver/library that has patched files (without overwriting the patches)
 
+    Two overlays are applied, in order, and later files win:
+      EmbeddedSw/              every target (as before)
+      EmbeddedSw.<arch>/       only that architecture, e.g. EmbeddedSw.microblaze/
+    The per-arch one is optional and purely additive: a repo that does not have
+    the directory behaves exactly as it always did. Use it for a patch that
+    must NOT reach the other architectures' BSPs -- a BSP metadata change that
+    is right for a MicroBlaze design, say, but would alter what the tools
+    generate for a Zynq one.
+
     Returns the path to the local embeddedsw repo, or None if no EmbeddedSw/ folder.
     """
-    embeddedsw_src = os.path.join(repo_root, "EmbeddedSw")
-    if not os.path.isdir(embeddedsw_src):
+    overlays = [os.path.join(repo_root, "EmbeddedSw")]
+    if arch:
+        overlays.append(os.path.join(repo_root, f"EmbeddedSw.{arch}"))
+    overlays = [d for d in overlays if os.path.isdir(d)]
+    if not overlays:
         return None
 
     # Locate install's embeddedsw: XILINX_VITIS is e.g. /path/2025.2/Vitis
@@ -171,18 +192,19 @@ def setup_embeddedsw(repo_root, workspace):
     local_esw = os.path.join(workspace, "embeddedsw")
     info(f"Setting up local embeddedsw repo in {local_esw}")
 
-    # Step 1: Copy all patched files from repo's EmbeddedSw/ into workspace
-    for root, _, files in os.walk(embeddedsw_src):
-        if not files:
-            continue
-        rel_dir = os.path.relpath(root, embeddedsw_src)
-        if rel_dir == ".":
-            continue  # skip root-level files (e.g. README.md)
-        dst_dir = os.path.join(local_esw, rel_dir)
-        os.makedirs(dst_dir, exist_ok=True)
-        for f in files:
-            shutil.copy2(os.path.join(root, f), os.path.join(dst_dir, f))
-    info(f"  Copied patched files from EmbeddedSw/")
+    # Step 1: Copy all patched files from the repo's overlay(s) into workspace
+    for embeddedsw_src in overlays:
+        for root, _, files in os.walk(embeddedsw_src):
+            if not files:
+                continue
+            rel_dir = os.path.relpath(root, embeddedsw_src)
+            if rel_dir == ".":
+                continue  # skip root-level files (e.g. README.md)
+            dst_dir = os.path.join(local_esw, rel_dir)
+            os.makedirs(dst_dir, exist_ok=True)
+            for f in files:
+                shutil.copy2(os.path.join(root, f), os.path.join(dst_dir, f))
+        info(f"  Copied patched files from {os.path.basename(embeddedsw_src)}/")
 
     # Step 2: Find all 'src' and 'data' directories that should be in the local copy.
     # Look at the install's counterpart for each patched directory's parent to find
@@ -287,6 +309,23 @@ def _find_modules(xml_bytes):
             out.append((inst, vlnv))
     return out
 
+def _select_app_microblaze(names):
+    """Pick the *application* MicroBlaze out of the cores found in the top
+    block-design .hwh. On UltraScale DDR4 boards the MIG instantiates a
+    calibration MicroBlaze inside a MicroBlaze-MCS sub-block (normally in its
+    own '*_microblaze_mcs.hwh', which this function never sees, but be
+    defensive): drop anything that looks like an MCS sub-block and prefer the
+    conventional 'microblaze_0' / 'microblaze_<n>' top-level name. Same rule
+    as make-boot.py's _select_app_microblaze()."""
+    if not names:
+        return "microblaze_0"
+    cands = [n for n in names if "_mcs" not in n.lower()] or list(names)
+    cands.sort(key=lambda n: (
+        n.split("/")[-1] != "microblaze_0",
+        re.fullmatch(r"microblaze_\d+", n.split("/")[-1]) is None,
+    ))
+    return cands[0]
+
 def detect_arch_and_cpu_from_xsa(xsa_path, bd_name):
     """
     Returns:
@@ -307,8 +346,8 @@ def detect_arch_and_cpu_from_xsa(xsa_path, bd_name):
     has = {k: any(h in v for v in vlnvs) for k, h in CPU_VLNV_HINTS.items()}
 
     if has["microblaze"]:
-        mb_inst = next((n for n, v in modules if "microblaze" in v), "microblaze_0")
-        return "microblaze", mb_inst
+        return "microblaze", _select_app_microblaze(
+            [n for n, v in modules if "microblaze" in v])
     if has["versal_cips"]:
         return "versal", "psv_cortexa72_0"
     if has["zynq_ultra_ps_e"]:
@@ -318,9 +357,38 @@ def detect_arch_and_cpu_from_xsa(xsa_path, bd_name):
     return None, None
 
 # ---------------- linker script modifications ----------------
+def resolve_size_option(value, arch):
+    """args.json "stack_size"/"heap_size": a plain string applies to every
+    architecture (the original behaviour); a dict selects per architecture,
+    e.g. {"microblaze": "0x8000"}, and an architecture that is not listed
+    keeps the size the tools generated."""
+    if isinstance(value, dict):
+        return value.get(arch)
+    return value
+
+# Sections that "code_local_bss_ddr" leaves in DDR: the zero-initialised,
+# NOLOAD data that is too big for the LMB. Everything else -- code, read-only
+# data, initialised data, small-data (.sdata/.sbss stay together: the r13
+# small-data window), constructors, .drvcfg_sec and the stack -- goes to the
+# local memory, which is all updatemem can embed in the bitstream.
+CODE_LOCAL_DDR_SECTIONS = (".bss", ".heap")
+
+def _relocate_sections(text, names, target_mem):
+    """Point the output sections in 'names' at target_mem."""
+    for name in names:
+        pat = re.compile(r'(^' + re.escape(name) + r'\b[^{\n]*\{.*?\}\s*>\s*)(\S+)',
+                         re.MULTILINE | re.DOTALL)
+        text, n = pat.subn(lambda m: m.group(1) + target_mem, text, count=1)
+        if n == 0:
+            info(f"WARNING: section {name} not found in lscript.ld; left as is.")
+    return text
+
 def modify_linker_script(lscript_path, mod_type):
     """Modify the auto-generated linker script.
-    mod_type: "relocate_to_local_mem" or "relocate_to_ddr"
+    mod_type: "relocate_to_local_mem", "relocate_to_ddr" or
+    "code_local_bss_ddr" (MicroBlaze booting from the bitstream with a big
+    .bss: everything in the local memory except CODE_LOCAL_DDR_SECTIONS,
+    which go to DDR; the start-up code zeroes .bss wherever it is)
     """
     if not os.path.isfile(lscript_path):
         info(f"WARNING: lscript.ld not found at {lscript_path}; skipping linker mods.")
@@ -335,11 +403,17 @@ def modify_linker_script(lscript_path, mod_type):
         info("WARNING: No MEMORY entries found in lscript.ld; skipping.")
         return
 
-    if mod_type == "relocate_to_local_mem":
+    ddr_mem = None
+    if mod_type in ("relocate_to_local_mem", "code_local_bss_ddr"):
         target_mem = next((m for m in memories if "local_memory" in m), None)
         if not target_mem:
             info("WARNING: No local_memory found in lscript.ld; skipping relocation.")
             return
+        if mod_type == "code_local_bss_ddr":
+            ddr_mem = next((m for m in memories if "ddr" in m.lower()), None)
+            if not ddr_mem:
+                info("WARNING: No DDR memory found in lscript.ld; skipping relocation.")
+                return
     elif mod_type == "relocate_to_ddr":
         target_mem = next((m for m in memories if "ddr" in m.lower()), None)
         if not target_mem:
@@ -351,11 +425,86 @@ def modify_linker_script(lscript_path, mod_type):
 
     for m in memories:
         if m != target_mem:
-            text = re.sub(r'>\s*' + re.escape(m), f'> {target_mem}', text)
+            text = re.sub(r'>\s*' + re.escape(m) + r'\b', f'> {target_mem}', text)
+    if ddr_mem:
+        text = _relocate_sections(text, CODE_LOCAL_DDR_SECTIONS, ddr_mem)
 
     with open(lscript_path, "w", encoding="utf-8") as f:
         f.write(text)
-    info(f"Linker script: relocated all sections to {target_mem}")
+    if ddr_mem:
+        info(f"Linker script: {', '.join(CODE_LOCAL_DDR_SECTIONS)} in {ddr_mem}, "
+             f"everything else in {target_mem}")
+    else:
+        info(f"Linker script: relocated all sections to {target_mem}")
+
+def report_local_mem_use(elf_path, lscript_path):
+    """Print how much of the MicroBlaze local memory (LMB) the ELF occupies:
+    the sections that updatemem embeds in the bitstream, plus the stack. The
+    linker already fails on an overflow; this is the headroom figure."""
+    try:
+        with open(lscript_path, "r", encoding="utf-8") as f:
+            text = f.read()
+        m = re.search(r'(\S*local_memory\S*)\s*:\s*ORIGIN\s*=\s*(0x[0-9a-fA-F]+)\s*,'
+                      r'\s*LENGTH\s*=\s*(0x[0-9a-fA-F]+)', text)
+        if not m:
+            return
+        origin, length = int(m.group(2), 16), int(m.group(3), 16)
+        out = subprocess.run(["mb-size", "-A", elf_path], stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True).stdout
+    except (OSError, ValueError):
+        return
+    used, rows = 0, []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
+            continue
+        name, size, addr = parts[0], int(parts[1]), int(parts[2])
+        if size and addr < origin + length and not name.startswith((".debug", ".comment")):
+            used += size
+            rows.append(f"{name} {size}")
+    top = origin + length   # the vectors below ORIGIN are part of the LMB too
+    info(f"Local memory (LMB) use: {used} of {top} bytes ({100.0 * used / top:.1f} %), "
+         f"{top - used} free: " + ", ".join(rows))
+
+def set_gc_sections(app_src):
+    """Turn on section garbage collection in the app component's
+    UserConfig.cmake: USER_COMPILE_GARBAGE (compile with -ffunction-sections
+    -fdata-sections) and -Wl,--gc-sections in USER_LINK_OTHER_FLAGS. The
+    generated linker script KEEPs the vectors, .init/.fini, constructors and
+    .drvcfg_sec, so only unreferenced code and data are dropped."""
+    path = os.path.join(app_src, "UserConfig.cmake")
+    if not os.path.isfile(path):
+        info(f"WARNING: {path} not found; no section garbage collection.")
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    text, n1 = re.subn(r'set\(USER_COMPILE_GARBAGE[^)]*\)',
+                       'set(USER_COMPILE_GARBAGE "-Wl,--gc-sections")', text, count=1)
+    text, n2 = re.subn(r'set\(USER_LINK_OTHER_FLAGS\s*',
+                       'set(USER_LINK_OTHER_FLAGS -Wl,--gc-sections\n', text, count=1)
+    if n1 == 0 or n2 == 0:
+        info("WARNING: USER_COMPILE_GARBAGE / USER_LINK_OTHER_FLAGS not found in UserConfig.cmake.")
+        return
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    info("UserConfig.cmake: section garbage collection (--gc-sections) on")
+
+def set_compile_optimization(app_src, level):
+    """Set the app component's USER_COMPILE_OPTIMIZATION_LEVEL (UserConfig.cmake)."""
+    path = os.path.join(app_src, "UserConfig.cmake")
+    if not os.path.isfile(path):
+        info(f"WARNING: {path} not found; optimisation level left at the default.")
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    text, n = re.subn(r'set\(USER_COMPILE_OPTIMIZATION_LEVEL[^)]*\)',
+                      f'set(USER_COMPILE_OPTIMIZATION_LEVEL {level})', text, count=1)
+    if n == 0:
+        info("WARNING: USER_COMPILE_OPTIMIZATION_LEVEL not found in UserConfig.cmake.")
+        return
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    info(f"UserConfig.cmake: optimisation level {level}")
 
 # ---------------- Vitis API (must run under `vitis -source`) ----------------
 try:
@@ -526,6 +675,8 @@ def main():
     user_dtsi_generator = cfg.get("user_dtsi_generator")
     stack_size = cfg.get("stack_size")
     heap_size = cfg.get("heap_size")
+    compile_opt = cfg.get("compile_optimization")
+    gc_sections = cfg.get("gc_sections")
 
     # Board name for board.h: prefer args.json's "boardnames" map — that's
     # the short ID used by fmc-prod-test-common's eeprom_fmc.c (e.g. "UZEV",
@@ -591,6 +742,13 @@ def main():
         die("Could not detect architecture from XSA (MicroBlaze/Zynq/ZynqMP/Versal).")
     info(f"Detected arch   : {arch} (cpu/core hint: {cpu_hint})")
 
+    # stack_size/heap_size may be per-architecture maps -- resolve now that
+    # the architecture is known.
+    stack_size = resolve_size_option(stack_size, arch)
+    heap_size  = resolve_size_option(heap_size, arch)
+    compile_opt = resolve_size_option(compile_opt, arch)
+    gc_sections = resolve_size_option(gc_sections, arch)
+
     # Create workspace, platform, domain, app
     client = vitis.create_client()
     try:
@@ -598,7 +756,7 @@ def main():
 
         # Set up local embeddedsw repo (patched BSP drivers) if present
         repo_root = os.path.normpath(os.path.join(cwd, ".."))
-        local_esw = setup_embeddedsw(repo_root, workspace)
+        local_esw = setup_embeddedsw(repo_root, workspace, arch)
         if local_esw:
             client.set_embedded_sw_repo(level='LOCAL', path=local_esw)
             info(f"Registered local embeddedsw repo: {local_esw}")
@@ -728,12 +886,6 @@ def main():
         # Create board.h in app src
         create_board_h(board_name_for_header, app_src)
 
-        # Linker script modifications (if configured for this arch)
-        lscript_path = os.path.join(app_src, "lscript.ld")
-        if arch in linker_mods:
-            info(f"Applying linker script mod: {linker_mods[arch]}")
-            modify_linker_script(lscript_path, linker_mods[arch])
-
         # Stack/heap size overrides (if configured)
         if stack_size or heap_size:
             ld = app.get_ld_script()
@@ -743,6 +895,19 @@ def main():
             if heap_size:
                 ld.set_heap_size(size=heap_size)
                 info(f"Linker script: heap size set to {heap_size}")
+
+        # Linker script modifications (if configured for this arch), after the
+        # stack/heap sizes so that nothing rewrites the regions afterwards
+        lscript_path = os.path.join(app_src, "lscript.ld")
+        if arch in linker_mods:
+            info(f"Applying linker script mod: {linker_mods[arch]}")
+            modify_linker_script(lscript_path, linker_mods[arch])
+
+        # App optimisation level (if configured for this arch)
+        if compile_opt:
+            set_compile_optimization(app_src, compile_opt)
+        if gc_sections is True or str(gc_sections).lower() == "true":
+            set_gc_sections(app_src)
 
         # Run pre-build script (if configured)
         if pre_build_script:
@@ -761,6 +926,8 @@ def main():
         build_ok = os.path.isfile(elf_path)
         if build_ok:
             info(f"{app_name} build succeeded: {elf_path}")
+            if arch == "microblaze":
+                report_local_mem_use(elf_path, lscript_path)
         else:
             info(f"{app_name} build failed. ")
 

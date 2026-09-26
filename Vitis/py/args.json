@@ -21,7 +21,23 @@
 	"src": {
 		"all": "common/src"
 	},
-	"stack_size": "0x10000",
-	"heap_size": "0x10000",
-	"combine_bit_elf": false
+	"linker_script_mods": {
+		"microblaze": "code_local_bss_ddr"
+	},
+	"compile_optimization": {
+		"microblaze": "-O2"
+	},
+	"gc_sections": {
+		"microblaze": true
+	},
+	"stack_size": {
+		"microblaze": "0x8000",
+		"versal": "0x10000"
+	},
+	"heap_size": {
+		"microblaze": "0x10000",
+		"versal": "0x10000"
+	},
+	"pre_platform_build_script": "py/pre_platform_build.py",
+	"combine_bit_elf": true
 }

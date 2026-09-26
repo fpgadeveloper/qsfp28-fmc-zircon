@@ -5,7 +5,8 @@ that cost real time, and that anyone extending the design, porting it to another
 the Taxi submodule or debugging the link is likely to run into again. The sections follow the
 build chain: Zircon itself, the MRMAC, Vivado, software. The later sections record the change
 of scope to a bare-metal-only design, the review fixes of version 1.1 and the second port and
-hardware traffic generator of version 1.2 ("Phase 2").
+hardware traffic generator of version 1.2 ("Phase 2"). The last section covers the KCU116
+target (2026-09-25).
 
 ## Zircon at Taxi `cc70b27`
 
@@ -384,3 +385,81 @@ Version 1.2 was validated on the bench; the results, including the throughput fo
   codewords (and 1 corrected) at each link-up on the optical cable, and none afterwards. This is
   a link-up transient; clear the counters (`c`) after the link is up before judging a soak.
 
+## KCU116 target (2026-09-25)
+
+The `kcu116` target puts port 0 on the XCKU5P's CMAC through Taxi's `taxi_eth_mac_100g_us`, with
+a MicroBlaze as the control plane. The full contract is §1.1, §2.2, §6b, §6c, §7.1, §8.1–8.2,
+§11.7 and §12.8 of `docs/DESIGN_SPEC.md`; these are the findings that cost time.
+
+**Taxi's 100G CMAC wrapper at `cc70b27`**
+
+* **No PTP.** The wrapper declares the timestamp ports (`tx_ptp_ts_out`, `rx_ptp_ts_out`,
+  `*_ptp_locked`, `m_axis_tx_cpl`) but never drives them, leaves the CMAC's timestamp outputs
+  open and ties its system-timer inputs to 0. With `PTP_TS_EN` = 1, `m_axis_rx.tuser` becomes 97
+  bits wide but is driven by a 1-bit signal. The design builds it with `PTP_TS_EN` = 0 and takes
+  its own timestamps in the shim, rather than modifying Taxi or dropping the latency feature.
+* **RS-FEC is hard-wired on** and its counters are not brought out; `cfg_tx/rx_max_pkt_len` are
+  not connected to the CMAC (the maximum frame length is the IP default, believed 9600 bytes;
+  9046-byte frames, the 9000-byte payload maximum of the generator, verified on a loopback plug).
+* **`xcvr_ctrl_clk` must be 125 MHz** (the GT wizard's free-running frequency and the CMAC's DRP
+  clock are generated for 125 MHz), and the transceiver-control APB is 16 bits wide with each
+  lane in its own 16-bit address space, so the APB address must be at least 18 bits.
+* **The GT APB registers ignore `pstrb`.** `taxi_axil_apb_adapter` splits a 32-bit AXI-Lite
+  access into two 16-bit transfers and marks the unused half with `pstrb` = 0; without help, a
+  16-bit write would also write the neighbouring register with the other half of `wdata`. The
+  shim completes such segments itself.
+* **The GT APB hangs while the transceivers are in reset**: the wrapper holds its APB
+  interconnect in reset with them. The shim answers SLVERR instead of letting the AXI bus hang.
+* **QPLL registers at decimal offsets.** Taxi decodes QPLL0 / QPLL1 at `14'd3000` / `14'd3100`,
+  which are byte offsets 0x0BB8 / 0x0C1C, not 0x3000 / 0x3100.
+* **SIM mode does not loop TX to RX.** With `SIM` = 1 the wrapper drops the GT and CMAC IP but
+  leaves the GT user clocks and its internal CMAC client interfaces undriven; Taxi's cocotb
+  benches drive them hierarchically, and the xsim bench does the same with `force`.
+* **The `.f` lists use a symlink** (`src/eth/lib/taxi -> ../../../`) that breaks on Windows
+  checkouts and zip downloads, and `taxi_eth_mac_stats.f` lists itself. The Vivado expander and
+  `run_xsim.sh` resolve `lib/taxi/` paths to the submodule root and track visited lists. One file
+  the lists pull in, `taxi_eth_phy_10g_usxgmii_an.sv`, does not compile in xsim (VRFC 10-3400)
+  and is not needed by the 100G wrapper.
+
+**Vivado**
+
+* **A module reference can carry the CMAC and GT IP out of context.** The block design stays in
+  the default OOC mode: `cmac_usplus` is synthesised inline (Taxi sets `generate_synth_checkpoint
+  false`) and the GT wizards are filled from their own checkpoints at link. No fallback was
+  needed.
+* **Constraint processing order.** Taxi's implementation-only CDC scripts find each crossing's
+  clocks with `get_clocks -of_objects`. On this target the CMAC clocks come from
+  `create_clock gt_ref_clk_0` in `kcu116.xdc`; with the default order the scripts ran before it,
+  `taxi_axis_async_fifo.tcl` silently skipped a false path, and the router detoured the paths
+  for hold: core clock WNS −13.1 ns and `ctrl_clk` −8.9 ns in the first build. `PROCESSING_ORDER
+  LATE` on the scripts fixed it.
+* **CMAC RX clock skew.** The CMAC limits the skew between its four RX serdes clocks to 1.0 ns.
+  Lane 0's clock also drives the whole `rx_clk` fabric domain, its clock root landed in X2Y2,
+  and the check failed at 1.342 ns. `USER_CLOCK_ROOT X3Y3` (the CMAC's clock region) on the four
+  buffers fixed it; `CLOCK_DELAY_GROUP` is ignored because the buffers have no common driver.
+* **`CONFIGRATE 33` is not a legal UltraScale+ value** (CRITICAL WARNING [Netlist 29-154]); the
+  2x-qsfp28-fmc `kcu116.xdc` it came from has the same bug. The design uses 31.9.
+* **Timing closed at 300 MHz on the first full build** with `Performance_ExplorePostRoutePhysOpt`
+  and a post-route `ExploreWithAggressiveHoldFix` (WNS +0.050 ns); the planned fall-backs (a
+  pblock, a 275 MHz core clock) were not needed. 250 MHz would not have been enough for the
+  receive path at 100G.
+
+**Software and boot**
+
+* **MicroBlaze caches are off after start-up** in 2025.2; `main()` enables them.
+* **xiltimer's 64-bit `XTime` is only 32 bits on an AXI timer** (43 s at 100 MHz), so the
+  application runs `axi_timer_1` as a cascaded 64-bit counter, and xiltimer's sleep timer is set
+  to `axi_timer_0` by name (`XILTIMER_sleep_timer`, in `pre_platform_build.py`).
+* **lwip220 refuses to build without an AMD Ethernet MAC** in the hardware; the
+  `EmbeddedSw.microblaze/` overlay removes that check for MicroBlaze only.
+* **Code size.** The Vitis default is `-O0 -g3`. At `-O2` with `--gc-sections` the application
+  (with lwIP, newlib and the drivers) uses 83 % of the 256 KB local memory; `-Os` saved only about
+  4 KB more. Everything zero-initialised (lwIP pools, DMA rings) goes to DDR, because only the
+  local memory can be embedded in the bitstream.
+* **The KCU116's flash is a 1 Gb MT25QU01G**, not the 32 MB part the board catalog and the
+  2x-qsfp28-fmc design assume: Vivado's `program_hw_cfgmem` rejects `mt25qu256` for it. Use
+  `mt25qu01g-spi-x1_x2_x4`. The board boots from it with the mode pins as delivered (master SPI).
+* **Everything worked on the first hardware load**: link, DHCP, all host tests, the 12-million
+  datagram soak, and the QSPI boot. The one thing the clock readings of the first status line
+  show is an artefact: they are measured over a 1 ms window that overlaps the transceiver reset
+  release.
